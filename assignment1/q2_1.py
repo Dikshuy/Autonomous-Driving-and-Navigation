@@ -3,7 +3,7 @@ import scipy.signal as signal
 import matplotlib.pyplot as plt
 
 class VehicleModel:
-    def __init__(self, mass, a, b, I_z, C_af, C_ar, delta, dt=0.01, sim_time=8):
+    def __init__(self, mass, a, b, I_z, C_af, C_ar, delta, dt=0.01, sim_time=10):
         self.m = mass
         self.a = a
         self.b = b
