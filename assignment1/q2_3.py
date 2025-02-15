@@ -61,18 +61,25 @@ class VehicleModel:
         for n in range(1, len(self.t)):
             if alpha_f[n-1] < self.alpha_s and alpha_r[n-1] < self.alpha_s:
                 x[:, n] = sys_d.A @ x[:, n-1] + sys_d.B.flatten() * self.delta
+                c = np.zeros(2)
             elif alpha_f[n-1] >= self.alpha_s and alpha_r[n-1] < self.alpha_s:
+                # Front saturation
                 sys_additional = self.create_additional_systems(speed, "front_saturated")
                 sys_d_additional = sys_additional.to_discrete(self.dt)
-                x[:, n] = sys_d_additional.A @ x[:, n-1] + np.array([self.F_yf / self.m, self.a * self.F_yf / self.I_z]) * self.dt
+                c = np.array([self.F_yf / self.m, self.a * self.F_yf / self.I_z])
+                x[:, n] = sys_d_additional.A @ x[:, n-1] + c * self.dt
             elif alpha_f[n-1] < self.alpha_s and alpha_r[n-1] >= self.alpha_s:
+                # Rear saturation
                 sys_additional = self.create_additional_systems(speed, "rear_saturated")
                 sys_d_additional = sys_additional.to_discrete(self.dt)
-                x[:, n] = sys_d_additional.A @ x[:, n-1] + sys_d_additional.B.flatten() * self.delta + np.array([self.F_yr / self.m, -self.b * self.F_yr / self.I_z]) * self.dt
+                c = np.array([self.F_yr / self.m, -self.b * self.F_yr / self.I_z])
+                x[:, n] = sys_d_additional.A @ x[:, n-1] + sys_d_additional.B.flatten() * self.delta + c * self.dt
             else:
+                # Both saturation
                 sys_additional = self.create_additional_systems(speed, "both_saturated")
                 sys_d_additional = sys_additional.to_discrete(self.dt)
-                x[:, n] = sys_d_additional.A @ x[:, n-1] + np.array([(self.F_yf + self.F_yr) / self.m, (self.a * self.F_yf - self.b * self.F_yr) / self.I_z]) * self.dt
+                c = np.array([(self.F_yf + self.F_yr) / self.m, (self.a * self.F_yf - self.b * self.F_yr) / self.I_z])
+                x[:, n] = sys_d_additional.A @ x[:, n-1] + c * self.dt
 
             theta[n] = x[1, n] * self.dt + theta[n-1]
             X[n] = (speed * (1000 / 3600) * np.cos(theta[n]) + x[0, n] * np.sin(theta[n])) * self.dt + X[n-1]
