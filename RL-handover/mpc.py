@@ -1,159 +1,234 @@
 import carla
 import numpy as np
+import cvxpy as cp
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize
+import pygame
+import time
 
-# =============================================
-# 1. CARLA Initialization
-# =============================================
-
-# Connect to CARLA server
-client = carla.Client('localhost', 2000)
-client.set_timeout(10.0)
-world = client.get_world()
-
-# Spawn ego vehicle
-blueprint_library = world.get_blueprint_library()
-vehicle_bp = blueprint_library.find('vehicle.tesla.model3')
-spawn_point = carla.Transform(carla.Location(x=100, y=0, z=0.5), carla.Rotation(yaw=0))
-vehicle = world.spawn_actor(vehicle_bp, spawn_point)
-
-# Enable traffic (optional)
-world.set_weather(carla.WeatherParameters.ClearNoon)
-traffic_manager = client.get_trafficmanager()
-traffic_manager.set_synchronous_mode(True)
-
-# =============================================
-# 2. Vehicle Dynamics Model (Bicycle Model)
-# =============================================
-
-class BicycleModel:
-    def __init__(self):
-        self.m = 1500.0    # mass (kg)
-        self.Iz = 3000.0   # yaw inertia (kg*m^2)
-        self.lf = 1.2      # CG to front axle (m)
-        self.lr = 1.6      # CG to rear axle (m)
-        self.Cf = 80000.0  # Front cornering stiffness (N/rad)
-        self.Cr = 80000.0  # Rear cornering stiffness (N/rad)
-        self.Vx = 10.0     # Longitudinal speed (m/s)
+class ModelPredictiveController:
+    def __init__(self, prediction_horizon=10, control_horizon=5):
+        """
+        Initialize Model Predictive Controller with specified vehicle state
+        
+        State vector: [β (sideslip), ψ_dot (yaw rate), ψ (heading), y (lateral position)]
+        Input: steering angle
+        
+        :param prediction_horizon: Number of steps to predict ahead
+        :param control_horizon: Number of control steps to optimize
+        """
+        self.prediction_horizon = prediction_horizon
+        self.control_horizon = control_horizon
+        
+        # Vehicle parameters (these need to be tuned to your specific vehicle)
+        self.L = 2.7    # wheelbase length
+        self.Cf = 1000  # front cornering stiffness
+        self.Cr = 1000  # rear cornering stiffness
+        self.m = 1500   # vehicle mass
+        self.Iz = 2000  # moment of inertia
+        self.g = 9.81   # gravity
+        
+        # Constraints
+        self.max_steering = np.radians(30)  # maximum steering angle
+        self.max_acceleration = 5.0  # maximum acceleration/deceleration
     
-    def predict(self, x, delta):
-        beta, psi_dot, psi, y = x
+    def vehicle_model(self, state, u_steering, v=10, dt=0.1):
+        """
+        Vehicle dynamic model
         
-        # Slip angles
-        alpha_f = delta - (beta + self.lf * psi_dot / self.Vx)
-        alpha_r = -(beta - self.lr * psi_dot / self.Vx)
+        :param state: Current state [β, ψ_dot, ψ, y]
+        :param u_steering: Steering input
+        :param v: Velocity (assumed constant for simplicity)
+        :param dt: Time step
+        :return: Next state
+        """
+        beta, psi_dot, psi, y = state
         
-        # Lateral forces
-        Fyf = self.Cf * alpha_f
-        Fyr = self.Cr * alpha_r
+        # Simplified dynamic model
+        # You would replace these with more accurate dynamic equations
+        # based on your specific vehicle characteristics
         
-        # Dynamics
-        d_beta = (Fyf + Fyr) / (self.m * self.Vx) - psi_dot
-        d_psi_dot = (self.lf * Fyf - self.lr * Fyr) / self.Iz
-        d_psi = psi_dot
-        d_y = self.Vx * (beta + psi)
+        # Lateral acceleration
+        ay = psi_dot * v
         
-        return np.array([d_beta, d_psi_dot, d_psi, d_y])
-
-# =============================================
-# 3. MPC Controller
-# =============================================
-
-class MPC:
-    def __init__(self):
-        self.model = BicycleModel()
-        self.dt = 0.1     # Control timestep (s)
-        self.horizon = 10  # Prediction horizon
+        # Sideslip angle derivative
+        beta_dot = (self.Cf * u_steering - (self.Cf + self.Cr) * beta / (m * v)) 
         
-    def cost_function(self, u, *args):
-        x, y_ref = args
+        # Yaw rate derivative
+        psi_dot_dot = (self.Cf * u_steering * self.L - (self.Cf * self.L - self.Cr * self.L) * beta / (self.Iz * v))
+        
+        # Update state
+        next_beta = beta + beta_dot * dt
+        next_psi_dot = psi_dot + psi_dot_dot * dt
+        next_psi = psi + psi_dot * dt
+        next_y = y + v * np.sin(beta) * dt
+        
+        return [next_beta, next_psi_dot, next_psi, next_y]
+    
+    def solve_mpc(self, current_state, target_trajectory, v=10):
+        """
+        Solve Model Predictive Control optimization problem
+        
+        :param current_state: Current vehicle state [β, ψ_dot, ψ, y]
+        :param target_trajectory: Target trajectory to follow
+        :param v: Velocity
+        :return: Optimal steering input
+        """
+        # Define optimization variables
+        u_steering = cp.Variable((self.control_horizon, 1))
+        
+        # Predicted states
+        states = np.zeros((self.prediction_horizon + 1, 4))
+        states[0] = current_state
+        
+        # Cost function
         cost = 0.0
-        x_pred = x.copy()
+        constraints = []
         
-        for i in range(self.horizon):
-            delta = u[i]
-            dx = self.model.predict(x_pred, delta)
-            x_pred += dx * self.dt
-            cost += (x_pred[3] - y_ref)**2 + 0.1 * delta**2  # Track ref + minimize steering
+        dt = 0.1  # time step
         
-        return cost
-    
-    def optimize(self, x, y_ref):
-        # Initial guess (zero steering)
-        u0 = np.zeros(self.horizon)
+        # Simulate prediction and construct optimization problem
+        for t in range(self.prediction_horizon):
+            # Simulate next state
+            states[t+1] = self.vehicle_model(states[t], 
+                                             u_steering[min(t, self.control_horizon-1)], 
+                                             v, dt)
+            
+            # Track trajectory cost
+            track_cost = cp.norm2(states[t+1][3] - target_trajectory[t+1][1])  # Track y-position
+            
+            # Control input cost (smoothness)
+            control_cost = cp.norm2(u_steering[min(t, self.control_horizon-1)])
+            
+            cost += track_cost + 0.1 * control_cost
+            
+            # Constraints
+            constraints += [
+                cp.abs(u_steering[min(t, self.control_horizon-1)]) <= self.max_steering
+            ]
         
-        # Bounds (-0.5 to 0.5 radian steering)
-        bounds = [(-0.5, 0.5) for _ in range(self.horizon)]
+        # Solve optimization problem
+        prob = cp.Problem(cp.Minimize(cost), constraints)
+        prob.solve()
         
-        # Solve optimization
-        res = minimize(
-            self.cost_function,
-            u0,
-            args=(x, y_ref),
-            bounds=bounds,
-            method='SLSQP'
-        )
-        
-        return res.x[0]  # Return first control input
+        return u_steering.value[0][0]
 
-# =============================================
-# 4. Simulation Loop
-# =============================================
-
-def main():
-    mpc = MPC()
-    vehicle.set_autopilot(False)
+def run_carla_mpc():
+    """
+    Main function to run MPC in Carla with visualization
+    """
+    # Connect to Carla
+    client = carla.Client('localhost', 2000)
+    client.set_timeout(10.0)
+    world = client.get_world()
     
-    # Logging
-    time_log = []
-    y_log = []
-    y_ref_log = []
+    # Spawn vehicle
+    blueprint_library = world.get_blueprint_library()
+    vehicle_bp = blueprint_library.filter('model3')[0]
+    spawn_point = carla.Transform(carla.Location(x=0, y=0, z=1))
+    vehicle = world.spawn_actor(vehicle_bp, spawn_point)
+    
+    # Spectator for tracking
+    spectator = world.get_spectator()
+    
+    # Create MPC controller
+    mpc_controller = ModelPredictiveController()
+    
+    # Generate sample target trajectory (sinusoidal path)
+    target_trajectory = []
+    for x in np.linspace(0, 200, mpc_controller.prediction_horizon + 1):
+        y = 3 * np.sin(x * 0.05)  # Sinusoidal path with amplitude 3
+        target_trajectory.append((x, y))
+    
+    # Visualization setup
+    plt.ion()
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    
+    # Tracking plot
+    tracking_line, = ax1.plot([], [], 'r-', label='Vehicle Path')
+    target_line, = ax1.plot([], [], 'b--', label='Target Path')
+    ax1.set_xlabel('X Position')
+    ax1.set_ylabel('Y Position')
+    ax1.legend()
+    
+    # State plot
+    state_lines = [ax2.plot([], [], label=f'State {i}')[0] for i in range(4)]
+    ax2.set_xlabel('Time Step')
+    ax2.set_ylabel('State Values')
+    ax2.legend()
+    
+    # Data storage for plotting
+    vehicle_path = {'x': [], 'y': []}
+    states_history = {'beta': [], 'psi_dot': [], 'psi': [], 'y': []}
     
     try:
-        for t in np.arange(0, 30, 0.1):  # Run for 30 seconds
-            # Get current state (simplified - in reality use sensors)
+        # Main control loop
+        velocity = 10  # Constant velocity
+        current_state = [0, 0, 0, 0]  # Initial state [β, ψ_dot, ψ, y]
+        
+        for step in range(200):  # Limit steps for demonstration
+            # Get current vehicle state from Carla
             transform = vehicle.get_transform()
-            y = transform.location.y
-            psi = np.radians(transform.rotation.yaw)
             
-            # Simple state estimation (for demo)
-            x = np.array([0.0, 0.0, psi, y])  # [beta, psi_dot, psi, y]
+            # Compute MPC control
+            steering = mpc_controller.solve_mpc(current_state, target_trajectory, velocity)
             
-            # Reference path (sine wave)
-            y_ref = 2.0 * np.sin(0.1 * t)
+            # Apply control to vehicle
+            control = carla.VehicleControl()
+            control.steer = steering / mpc_controller.max_steering  # Normalize steering
+            control.throttle = 0.5  # Constant throttle
             
-            # MPC control
-            delta = mpc.optimize(x, y_ref)
+            vehicle.apply_control(control)
             
-            # Apply control
-            vehicle.apply_control(
-                carla.VehicleControl(
-                    steer=delta,
-                    throttle=0.3  # Constant speed
-                )
+            # Update spectator to follow vehicle
+            spectator_transform = carla.Transform(
+                transform.location + carla.Location(z=20),
+                carla.Rotation(pitch=-90)
+            )
+            spectator.set_transform(spectator_transform)
+            
+            # Simulate next state using our model
+            current_state = mpc_controller.vehicle_model(
+                current_state, steering, velocity
             )
             
-            # Log
-            time_log.append(t)
-            y_log.append(y)
-            y_ref_log.append(y_ref)
+            # Store path and states for visualization
+            vehicle_path['x'].append(transform.location.x)
+            vehicle_path['y'].append(transform.location.y)
             
-            # CARLA tick
-            world.tick()
-    
-    finally:
-        # Cleanup
-        vehicle.destroy()
+            for i, key in enumerate(['beta', 'psi_dot', 'psi', 'y']):
+                states_history[key].append(current_state[i])
+            
+            # Update plots
+            tracking_line.set_xdata(vehicle_path['x'])
+            tracking_line.set_ydata(vehicle_path['y'])
+            
+            target_x = [p[0] for p in target_trajectory]
+            target_y = [p[1] for p in target_trajectory]
+            target_line.set_xdata(target_x)
+            target_line.set_ydata(target_y)
+            
+            for i, line in enumerate(state_lines):
+                state_keys = ['beta', 'psi_dot', 'psi', 'y']
+                line.set_xdata(range(len(states_history[state_keys[i]])))
+                line.set_ydata(states_history[state_keys[i]])
+            
+            ax1.relim()
+            ax1.autoscale_view()
+            ax2.relim()
+            ax2.autoscale_view()
+            
+            plt.pause(0.1)
+            
+            # Small delay to control simulation speed
+            time.sleep(0.1)
         
-        # Plot results
-        plt.figure()
-        plt.plot(time_log, y_log, label='Actual Path')
-        plt.plot(time_log, y_ref_log, '--', label='Reference Path')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Lateral Position (m)')
-        plt.legend()
+    except Exception as e:
+        print(f"Error occurred: {e}")
+    finally:
+        # Clean up
+        vehicle.destroy()
+        plt.ioff()
         plt.show()
 
 if __name__ == '__main__':
-    main()
+    run_carla_mpc()
