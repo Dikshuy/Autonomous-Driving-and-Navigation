@@ -138,7 +138,12 @@ class CarlaInterface:
             self.world.apply_settings(settings)
             
             self.blueprint_library = self.world.get_blueprint_library()
-            self.spawn_vehicle_on_straight_road()
+            self.vehicle = None
+            self.attempt_spawn_vehicle()
+            
+            if not self.vehicle:
+                raise RuntimeError("Failed to spawn vehicle after multiple attempts")
+                
             self.setup_visualization()
             
             self.collision_count = 0
@@ -151,54 +156,43 @@ class CarlaInterface:
             self.cleanup()
             raise
 
-    def spawn_vehicle_on_straight_road(self):
-        """Find a long straight road segment"""
+    def attempt_spawn_vehicle(self, max_attempts=10):
+        """Robust vehicle spawning with collision checks"""
         spawn_points = self.map.get_spawn_points()
+        random.shuffle(spawn_points)  # Try spawn points in random order
         
-        # Prefer highway spawn points
-        highway_spawns = [sp for sp in spawn_points 
-                         if self.map.get_waypoint(sp.location).is_junction == False]
+        for attempt in range(max_attempts):
+            for spawn_point in spawn_points:
+                try:
+                    # Check if spawn point is clear
+                    if self.is_spawn_point_clear(spawn_point.location):
+                        vehicle_bp = self.blueprint_library.find('vehicle.tesla.model3')
+                        self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+                        
+                        if self.vehicle:
+                            self.vehicle.set_autopilot(False)
+                            print(f"Successfully spawned vehicle at {spawn_point.location}")
+                            self.generate_waypoints_ahead(150.0)
+                            return
+                            
+                except Exception as e:
+                    print(f"Spawn attempt {attempt+1} failed: {e}")
         
-        if not highway_spawns:
-            highway_spawns = spawn_points
-        
-        # Find spawn point with straight path ahead
-        best_spawn = None
-        max_straight_distance = 0
-        
-        for sp in highway_spawns:
-            wp = self.map.get_waypoint(sp.location)
-            straight_dist = self.check_straight_path(wp, distance=100.0)
-            if straight_dist > max_straight_distance:
-                max_straight_distance = straight_dist
-                best_spawn = sp
-        
-        if not best_spawn:
-            best_spawn = random.choice(highway_spawns)
-        
-        # Spawn vehicle without physics control attribute
+        print("Warning: Using forced spawn - may collide with objects")
         vehicle_bp = self.blueprint_library.find('vehicle.tesla.model3')
-        self.vehicle = self.world.spawn_actor(vehicle_bp, best_spawn)
+        self.vehicle = self.world.spawn_actor(vehicle_bp, random.choice(spawn_points))
         self.vehicle.set_autopilot(False)
-        
-        # Generate waypoints
-        self.generate_waypoints_ahead(150.0)
-        
-        # Set spectator
-        self.spectator = self.world.get_spectator()
-        self.update_spectator_view()
 
-    def check_straight_path(self, waypoint, distance=50.0):
-        """Check how straight the road is ahead"""
-        current = waypoint
-        total_distance = 0
-        while total_distance < distance:
-            next_wps = current.next(5.0)
-            if not next_wps:
-                break
-            current = next_wps[0]
-            total_distance += 5.0
-        return total_distance
+    def is_spawn_point_clear(self, location, radius=3.0):
+        """Check if spawn area is free of objects"""
+        # Get nearby actors
+        nearby_actors = self.world.get_actors().filter('static.*')
+        
+        # Check distance to each static object
+        for actor in nearby_actors:
+            if location.distance(actor.get_location()) < radius:
+                return False
+        return True
 
     def generate_waypoints_ahead(self, distance):
         """Create reference path using waypoints"""
@@ -235,7 +229,7 @@ class CarlaInterface:
 
     def update_spectator_view(self):
         """Third-person chase view"""
-        if not hasattr(self, 'vehicle') or not self.vehicle:
+        if not self.vehicle:
             return
             
         transform = self.vehicle.get_transform()
@@ -281,14 +275,12 @@ class CarlaInterface:
             
         # Reset vehicle state
         current_transform = self.vehicle.get_transform()
-        reset_location = carla.Location(
-            x=current_transform.location.x,
-            y=current_transform.location.y,
-            z=current_transform.location.z + 0.5
-        )
+        
+        # Find nearest clear location
+        clear_location = self.find_nearest_clear_location(current_transform.location)
         
         reset_transform = carla.Transform(
-            reset_location,
+            clear_location,
             current_transform.rotation
         )
         
@@ -304,6 +296,19 @@ class CarlaInterface:
         # Regenerate waypoints
         self.generate_waypoints_ahead(100.0)
         time.sleep(1.0)  # Pause after collision
+
+    def find_nearest_clear_location(self, location, max_distance=20.0):
+        """Find nearest location without collisions"""
+        waypoints = self.map.generate_waypoints(2.0)
+        nearest_wps = sorted(waypoints, 
+                            key=lambda wp: wp.transform.location.distance(location))
+        
+        for wp in nearest_wps[:50]:  # Check 50 nearest waypoints
+            if self.is_spawn_point_clear(wp.transform.location):
+                return wp.transform.location
+        
+        print("Warning: No clear location found, using original")
+        return location + carla.Location(z=0.5)  # At least lift slightly
 
     def apply_control(self, steer):
         """Smooth, limited control application"""
@@ -332,6 +337,9 @@ class CarlaInterface:
             attach_to=self.vehicle
         )
         self.collision_sensor.listen(self.handle_collision)
+        
+        # Set spectator
+        self.spectator = self.world.get_spectator()
         
         try:
             while (time.time() - start_time) < duration and not self.should_stop:
@@ -370,12 +378,10 @@ class CarlaInterface:
 
     def cleanup(self):
         """Proper cleanup of all actors"""
-        actor_names = ['vehicle', 'camera', 'collision_sensor']
-        for name in actor_names:
-            if hasattr(self, name):
-                actor = getattr(self, name)
-                if actor and actor.is_alive:
-                    actor.destroy()
+        if hasattr(self, 'collision_sensor') and self.collision_sensor:
+            self.collision_sensor.destroy()
+        if hasattr(self, 'vehicle') and self.vehicle:
+            self.vehicle.destroy()
         
         # Reset synchronous mode
         if hasattr(self, 'world'):
