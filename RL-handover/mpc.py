@@ -1,7 +1,6 @@
 import carla
 import numpy as np
 import cvxpy as cp
-import math
 
 class VehicleMPC:
     def __init__(self, prediction_horizon=10, control_horizon=5):
@@ -10,12 +9,8 @@ class VehicleMPC:
         
         State vector: [β, ψ_dot, ψ, y]
         Control input: [δ] (steering angle)
-        
-        Parameters:
-        - prediction_horizon: Number of future timesteps to predict
-        - control_horizon: Number of control inputs to optimize
         """
-        # Vehicle parameters (example values, may need tuning)
+        # Vehicle parameters
         self.L = 2.7  # Wheelbase length (m)
         self.Cf = 60000.0  # Front cornering stiffness
         self.Cr = 60000.0  # Rear cornering stiffness
@@ -26,20 +21,20 @@ class VehicleMPC:
         self.prediction_horizon = prediction_horizon
         self.control_horizon = control_horizon
         
-        # Cost function weights (ensure float values)
-        self.Q_state = np.diag([10.0, 5.0, 10.0, 20.0])  # State cost (β, ψ_dot, ψ, y)
-        self.R_control = np.diag([1.0])  # Control input cost
+        # Simulation parameters
+        self.dt = 0.1  # Timestep
+        
+        # Cost function weights
+        self.Q_state = np.diag([10.0, 5.0, 10.0, 20.0])
+        self.R_control = np.diag([1.0])
         
         # Constraints
-        self.max_steering = float(np.deg2rad(30))  # Maximum steering angle
-        self.max_steering_rate = float(np.deg2rad(10))  # Maximum steering rate
-        
-        # Simulation timestep
-        self.dt = 0.1  # 100ms timestep
+        self.max_steering = np.deg2rad(30)
+        self.max_steering_rate = np.deg2rad(10)
     
-    def vehicle_dynamics(self, state, steering_input):
+    def vehicle_kinematics(self, state, steering_input):
         """
-        Bicycle kinematic model with lateral dynamics
+        Simplified vehicle kinematics model
         
         Args:
         - state: [β, ψ_dot, ψ, y]
@@ -50,36 +45,20 @@ class VehicleMPC:
         """
         beta, psi_dot, psi, y = state
         
-        # Lateral slip angle calculations
-        alpha_f = steering_input - math.atan2(psi_dot * self.L / 2.0, 1.0)
-        alpha_r = -math.atan2(psi_dot * self.L / 2.0, 1.0)
-        
-        # Lateral force calculations
-        Fy_f = self.Cf * alpha_f
-        Fy_r = self.Cr * alpha_r
-        
-        # State derivatives
-        beta_dot = (Fy_f + Fy_r) / (self.m * 9.81)
-        psi_dot_dot = (Fy_f * self.L / 2.0 - Fy_r * self.L / 2.0) / self.Iz
-        psi_dot_new = psi_dot + psi_dot_dot * self.dt
-        psi_new = psi + psi_dot * self.dt
-        y_dot = math.sin(psi) * 9.81  # Assuming constant velocity
-        y_new = y + y_dot * self.dt
+        # Simplified kinematic bicycle model
+        v = 10.0  # Constant velocity
+        beta_dot = 0.0  # Simplified
+        psi_dot_new = v * np.tan(steering_input) / self.L
+        psi_new = psi + psi_dot_new * self.dt
+        y_new = y + v * np.sin(psi_new) * self.dt
         
         return [beta_dot, psi_dot_new, psi_new, y_new]
     
     def solve_mpc(self, current_state, reference_trajectory):
         """
         Solve Model Predictive Control optimization problem
-        
-        Args:
-        - current_state: Current vehicle state [β, ψ_dot, ψ, y]
-        - reference_trajectory: Target trajectory to follow
-        
-        Returns:
-        - Optimal control input (steering angle)
         """
-        # Ensure inputs are numpy arrays with float type
+        # Ensure inputs are numpy arrays
         current_state = np.array(current_state, dtype=float)
         reference_trajectory = np.array(reference_trajectory, dtype=float)
         
@@ -90,27 +69,27 @@ class VehicleMPC:
         # Initial state constraint
         constraints = [x[0, :] == current_state]
         
-        # Build cost function and dynamics constraints
+        # Cost function
         cost = 0.0
+        
         for t in range(self.prediction_horizon):
-            # Ensure reference trajectory is within bounds
+            # Reference state (use last reference if horizon exceeds trajectory)
             ref_state = reference_trajectory[min(t, reference_trajectory.shape[0]-1), :]
             
             # State cost
             state_diff = x[t, :] - ref_state
-            cost += cp.quad_form(state_diff, np.eye(4))  # Use identity matrix for simplicity
+            cost += cp.quad_form(state_diff, self.Q_state)
             
             # Control input cost
             if t < self.control_horizon:
-                cost += cp.quad_form(u[t], np.eye(1))
+                cost += cp.quad_form(u[t], self.R_control)
             
             # Input constraints
             if t < self.control_horizon:
                 constraints += [
                     cp.abs(u[t]) <= self.max_steering
                 ]
-                
-                # Steering rate constraint (only after first timestep)
+                # Steering rate constraint
                 if t > 0:
                     constraints += [
                         cp.abs(u[t] - u[t-1]) <= self.max_steering_rate
@@ -118,19 +97,44 @@ class VehicleMPC:
             
             # Dynamics constraints
             control_input = u[min(t, self.control_horizon-1)]
-            dynamics_pred = self.vehicle_dynamics(x[t, :], control_input)
-            constraints += [x[t+1, :] == dynamics_pred]
+            
+            # Use NumPy operations instead of custom dynamics
+            next_state = np.array(self.vehicle_kinematics(x[t, :], control_input))
+            constraints += [x[t+1, :] == next_state]
         
         # Terminal cost
         terminal_ref = reference_trajectory[-1, :]
-        cost += cp.quad_form(x[-1, :] - terminal_ref, 10.0 * np.eye(4))
+        cost += cp.quad_form(x[-1, :] - terminal_ref, 10.0 * self.Q_state)
         
         # Solve optimization problem
         prob = cp.Problem(cp.Minimize(cost), constraints)
-        prob.solve(solver=cp.ECOS)  # Use ECOS solver for better compatibility
+        prob.solve(solver=cp.ECOS)
         
         # Return first control input or 0 if solve failed
         return float(u.value[0, 0]) if u.value is not None else 0.0
+    
+    def generate_reference_trajectory(self, initial_pose):
+        """
+        Generate a straight-line reference trajectory
+        
+        Args:
+        - initial_pose: Initial vehicle pose
+        
+        Returns:
+        - Trajectory as numpy array
+        """
+        trajectory = np.zeros((self.prediction_horizon + 1, 4))
+        
+        # Extract initial conditions
+        _, _, initial_psi, initial_y = initial_pose
+        
+        for t in range(self.prediction_horizon + 1):
+            trajectory[t, 0] = 0.0  # β (slip angle)
+            trajectory[t, 1] = 0.0  # ψ_dot (yaw rate)
+            trajectory[t, 2] = initial_psi  # ψ (heading) - keep constant for straight line
+            trajectory[t, 3] = initial_y  # y (lateral position) - keep constant
+        
+        return trajectory
     
     def get_vehicle_state(self, vehicle):
         """
@@ -149,52 +153,21 @@ class VehicleMPC:
         y = float(transform.location.y)  # Lateral position
         
         return [beta, psi_dot, psi, y]
-    
-    def generate_reference_trajectory(self):
-        """
-        Generate a reference trajectory for the vehicle to track
-        
-        Returns:
-        - Trajectory as numpy array
-        """
-        # Example: circular trajectory
-        trajectory = np.zeros((self.prediction_horizon + 1, 4))
-        for t in range(self.prediction_horizon + 1):
-            trajectory[t, 0] = 0.0  # β
-            trajectory[t, 1] = 0.0  # ψ_dot
-            trajectory[t, 2] = float(t * self.dt)  # ψ
-            trajectory[t, 3] = float(math.sin(t * self.dt))  # y
-        
-        return trajectory
 
 def spawn_vehicle(world, blueprint_library, spawn_attempts=10):
     """
     Robustly spawn a vehicle in the Carla world
-    
-    Args:
-    - world: Carla world instance
-    - blueprint_library: Blueprint library to select vehicle from
-    - spawn_attempts: Number of attempts to spawn vehicle
-    
-    Returns:
-    - Spawned vehicle actor or None if unsuccessful
     """
-    # Filter for vehicle blueprints (excluding bikes, etc.)
     vehicle_blueprints = blueprint_library.filter('vehicle.*')
-    
-    # Get all possible spawn points
     spawn_points = world.get_map().get_spawn_points()
     
     for attempt in range(spawn_attempts):
         try:
-            # Randomly select blueprint and spawn point
             blueprint = random.choice(vehicle_blueprints)
             spawn_point = random.choice(spawn_points)
             
-            # Attempt to spawn vehicle
             vehicle = world.spawn_actor(blueprint, spawn_point)
             
-            # Optional: Additional checks
             if vehicle:
                 print(f"Successfully spawned {blueprint.id} at {spawn_point}")
                 return vehicle
@@ -209,7 +182,7 @@ def main():
     try:
         # Connect to Carla
         client = carla.Client('localhost', 2000)
-        client.set_timeout(10.0)  # Set a timeout
+        client.set_timeout(10.0)
         
         # Get world and blueprint library
         world = client.get_world()
@@ -230,8 +203,8 @@ def main():
             # Get current vehicle state
             current_state = mpc_controller.get_vehicle_state(vehicle)
             
-            # Generate reference trajectory
-            reference_trajectory = mpc_controller.generate_reference_trajectory()
+            # Generate reference trajectory based on current state
+            reference_trajectory = mpc_controller.generate_reference_trajectory(current_state)
             
             # Solve MPC and get steering command
             steering_command = mpc_controller.solve_mpc(current_state, reference_trajectory)
