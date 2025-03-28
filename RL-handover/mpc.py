@@ -3,6 +3,7 @@ import numpy as np
 from casadi import *
 import matplotlib.pyplot as plt
 import time
+import pygame
 
 # Vehicle parameters (example values - adjust according to your vehicle)
 class VehicleParams:
@@ -181,17 +182,24 @@ class MPCController:
 # Carla interface class
 class CarlaInterface:
     def __init__(self, mpc_params):
-        self.mpc_params = mpc_params  # Store MPC parameters
+        self.mpc_params = mpc_params
         
-        # Connect to Carla server
+        # Connect to CARLA server
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
         
-        # Get world
+        # Get world and set synchronous mode for better control
         self.world = self.client.get_world()
+        settings = self.world.get_settings()
+        settings.synchronous_mode = True  # Enables synchronous mode
+        settings.fixed_delta_seconds = self.mpc_params.dt
+        self.world.apply_settings(settings)
         
         # Get blueprint library
         self.blueprint_library = self.world.get_blueprint_library()
+        
+        # Setup visualization
+        self.setup_visualization()
         
         # Spawn vehicle
         self.spawn_vehicle()
@@ -200,8 +208,34 @@ class CarlaInterface:
         self.time_history = []
         self.state_history = []
         self.control_history = []
+    
+    def setup_visualization(self):
+        """Set up CARLA's spectator view and other visualization elements"""
+        # Add a spectator camera that follows the vehicle
+        spectator = self.world.get_spectator()
         
+        # Set spectator to follow the vehicle (we'll update this in run_simulation)
+        self.spectator = spectator
+        
+        # Add a collision sensor to detect crashes
+        collision_bp = self.blueprint_library.find('sensor.other.collision')
+        self.collision_sensor = self.world.spawn_actor(
+            collision_bp,
+            carla.Transform(),
+            attach_to=self.vehicle
+        )
+        self.collision_sensor.listen(lambda event: print(f"Collision detected with {event.other_actor.type_id}"))
+        
+        # Initialize pygame for additional visualization
+        pygame.init()
+        self.display = pygame.display.set_mode(
+            (800, 600),
+            pygame.HWSURFACE | pygame.DOUBLEBUF
+        )
+        pygame.display.set_caption("CARLA MPC Control Visualization")
+      
     def spawn_vehicle(self):
+        """Spawn the vehicle and necessary sensors"""
         # Find a spawn point
         spawn_points = self.world.get_map().get_spawn_points()
         spawn_point = spawn_points[0]  # choose first spawn point
@@ -215,8 +249,41 @@ class CarlaInterface:
         # Set autopilot off
         self.vehicle.set_autopilot(False)
         
-        # Add a camera for visualization (optional)
-        self.add_camera()
+        # Add a RGB camera for visualization
+        camera_bp = self.blueprint_library.find('sensor.camera.rgb')
+        camera_bp.set_attribute('image_size_x', '800')
+        camera_bp.set_attribute('image_size_y', '600')
+        camera_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
+        self.camera = self.world.spawn_actor(
+            camera_bp,
+            camera_transform,
+            attach_to=self.vehicle
+        )
+        
+        # Add a lane invasion sensor
+        lane_bp = self.blueprint_library.find('sensor.other.lane_invasion')
+        self.lane_sensor = self.world.spawn_actor(
+            lane_bp,
+            carla.Transform(),
+            attach_to=self.vehicle
+        )
+        self.lane_sensor.listen(lambda event: print(f"Lane invasion detected: {event}"))
+
+    def update_visualization(self):
+        """Update the spectator view and pygame display"""
+        # Update spectator to follow vehicle
+        transform = self.vehicle.get_transform()
+        self.spectator.set_transform(carla.Transform(
+            transform.location + carla.Location(z=50),  # 50m above
+            carla.Rotation(pitch=-90)  # Look straight down
+        ))
+        
+        # Update pygame display
+        pygame.display.flip()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return False
+        return True
         
     def add_camera(self):
         # Add a RGB camera
@@ -254,24 +321,37 @@ class CarlaInterface:
         # Reference state (straight line driving)
         x_ref = np.array([0.0, 0.0, 0.0, 0.0])
         
-        while current_time < duration:
-            # Get current state
-            x0 = self.get_vehicle_state()
-            
-            # Solve MPC
-            steer, _ = controller.solve_mpc(x0, x_ref)
-            
-            # Apply control
-            self.apply_control(steer)
-            
-            # Record data
-            self.time_history.append(current_time)
-            self.state_history.append(x0)
-            self.control_history.append(steer)
-            
-            # Wait for next time step
-            time.sleep(self.mpc_params.dt)
-            current_time = time.time() - start_time
+        try:
+            while current_time < duration:
+                # Update CARLA world
+                self.world.tick()
+                
+                # Get current state
+                x0 = self.get_vehicle_state()
+                
+                # Solve MPC
+                steer, _ = controller.solve_mpc(x0, x_ref)
+                
+                # Apply control
+                self.apply_control(steer)
+                
+                # Update visualization
+                if not self.update_visualization():
+                    break
+                
+                # Record data
+                self.time_history.append(current_time)
+                self.state_history.append(x0)
+                self.control_history.append(steer)
+                
+                # Wait for next time step (handled by CARLA's synchronous mode)
+                current_time = time.time() - start_time
+                
+        finally:
+            # Ensure we disable synchronous mode
+            settings = self.world.get_settings()
+            settings.synchronous_mode = False
+            self.world.apply_settings(settings)
             
     def plot_results(self):
         # Convert to numpy arrays
@@ -319,17 +399,22 @@ def main():
         controller = MPCController(vehicle_params, mpc_params)
         
         # Connect to Carla and run simulation
-        carla_interface = CarlaInterface(mpc_params)  # Pass mpc_params here
+        carla_interface = CarlaInterface(mpc_params)
         carla_interface.run_simulation(controller, duration=20.0)
         
         # Plot results
         carla_interface.plot_results()
         
+    except KeyboardInterrupt:
+        print("Simulation stopped by user")
     finally:
         # Clean up
         if 'carla_interface' in locals():
             carla_interface.vehicle.destroy()
             carla_interface.camera.destroy()
+            carla_interface.collision_sensor.destroy()
+            carla_interface.lane_sensor.destroy()
+            pygame.quit()
         print("Simulation ended.")
 
 if __name__ == '__main__':
