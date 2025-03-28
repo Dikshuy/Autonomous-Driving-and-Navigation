@@ -2,6 +2,7 @@ import carla
 import numpy as np
 import cvxpy as cp
 import math
+import random
 
 class VehicleMPC:
     def __init__(self, prediction_horizon=10, control_horizon=5):
@@ -178,20 +179,82 @@ class VehicleMPC:
         
         return trajectory
 
+
+def spawn_vehicle(world, blueprint_library, spawn_attempts=10):
+    """
+    Robustly spawn a vehicle in the Carla world
+    
+    Args:
+    - world: Carla world instance
+    - blueprint_library: Blueprint library to select vehicle from
+    - spawn_attempts: Number of attempts to spawn vehicle
+    
+    Returns:
+    - Spawned vehicle actor or None if unsuccessful
+    """
+    # Filter for vehicle blueprints (excluding bikes, etc.)
+    vehicle_blueprints = blueprint_library.filter('vehicle.*')
+    
+    # Get all possible spawn points
+    spawn_points = world.get_map().get_spawn_points()
+    
+    for attempt in range(spawn_attempts):
+        try:
+            # Randomly select blueprint and spawn point
+            blueprint = random.choice(vehicle_blueprints)
+            spawn_point = random.choice(spawn_points)
+            
+            # Attempt to spawn vehicle
+            vehicle = world.spawn_actor(blueprint, spawn_point)
+            
+            # Optional: Additional checks
+            if vehicle:
+                print(f"Successfully spawned {blueprint.id} at {spawn_point}")
+                return vehicle
+        
+        except Exception as e:
+            print(f"Spawn attempt {attempt + 1} failed: {e}")
+    
+    print("Failed to spawn vehicle after multiple attempts")
+    return None
+
+
 # Example usage
 def main():
-    client = carla.Client('localhost', 2000)
-    world = client.get_world()
+    try:
+        # Connect to Carla
+        client = carla.Client('localhost', 2000)
+        client.set_timeout(10.0)  # Set a timeout
+        
+        # Get world and blueprint library
+        world = client.get_world()
+        blueprint_library = world.get_blueprint_library()
+        
+        # Spawn vehicle with robust method
+        vehicle = spawn_vehicle(world, blueprint_library)
+        
+        if vehicle is None:
+            print("Could not spawn vehicle")
+            return
+    # client = carla.Client('localhost', 2000)
+    # world = client.get_world()
     
-    # Spawn vehicle
-    blueprint_library = world.get_blueprint_library()
-    vehicle_bp = blueprint_library.filter('model3')[0]
-    spawn_point = carla.Transform(carla.Location(x=0, y=0, z=1))
-    vehicle = world.spawn_actor(vehicle_bp, spawn_point)
+    # # Spawn vehicle
+    # blueprint_library = world.get_blueprint_library()
+    # vehicle_bp = blueprint_library.filter('model3')[0]
+    # spawn_point = carla.Transform(carla.Location(x=0, y=0, z=1))
+    # vehicle = world.spawn_actor(vehicle_bp, spawn_point)
     
-    # Initialize MPC
-    mpc_controller = VehicleMPC()
-    mpc_controller.run_in_carla(world, vehicle)
+        # Initialize MPC
+        mpc_controller = VehicleMPC()
+        mpc_controller.run_in_carla(world, vehicle)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    
+    finally:
+        # Cleanup
+        if 'vehicle' in locals() and vehicle is not None:
+            vehicle.destroy()
 
 if __name__ == '__main__':
     main()
