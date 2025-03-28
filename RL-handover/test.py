@@ -57,7 +57,7 @@ def vehicle_model(params):
     
     # Yaw acceleration
     psi_ddot = (2/Iz) * (lf*Cf*(delta - beta - (lf*psi_dot)/vx) - 
-                          lr*Cr*(-beta + (lr*psi_dot)/vx)
+                          lr*Cr*(-beta + (lr*psi_dot)/vx))
     
     # Yaw angle derivative
     psi_dot = psi_dot  # trivial
@@ -120,10 +120,7 @@ class MPCController:
             x_next_pred = x + xdot * dt
             g.append(x_next - x_next_pred)
             
-            # Control constraints
-            g.append(u)  # will be bounded later
-            
-        # Terminal cost (can be different from running cost)
+        # Terminal cost
         obj += 10 * mtimes([(X[:, N] - x_ref).T, Q, (X[:, N] - x_ref)])
         
         # Create NLP problem
@@ -147,9 +144,11 @@ class MPCController:
         self.lbx = [-inf] * (4*(N+1)) + [-self.mpc_params.max_steer] * N
         self.ubx = [inf] * (4*(N+1)) + [self.mpc_params.max_steer] * N
         
-        # Constraint bounds (mostly equality constraints for dynamics)
-        self.lbg = [0] * (4*(N+1))
-        self.ubg = [0] * (4*(N+1))
+        # Constraint bounds
+        # 1 initial condition constraint + N dynamics constraints
+        num_constraints = 4 + 4*N  # 4 for initial condition, 4 for each dynamics constraint
+        self.lbg = [0] * num_constraints
+        self.ubg = [0] * num_constraints
         
     def solve_mpc(self, x0, x_ref):
         N = self.mpc_params.N
@@ -177,7 +176,7 @@ class MPCController:
         x_opt = vars_opt[:4*(N+1)].reshape(N+1, 4).T
         u_opt = vars_opt[4*(N+1):]
         
-        return u_opt[0], x_opt  # return first control and all predicted states
+        return u_opt[0], x_opt
 
 # Carla interface class
 class CarlaInterface:
