@@ -12,7 +12,7 @@ class VehicleParams:
         self.Iz = 3000.0      # yaw moment of inertia [kg*m^2]
         self.Cf = 100000.0    # increased cornering stiffness [N/rad]
         self.Cr = 100000.0    # increased cornering stiffness [N/rad]
-        self.vx = 15.0        # reduced speed for better control [m/s]
+        self.vx = 10.0        # reduced speed for better control [m/s]
 
 class MPCParams:
     def __init__(self):
@@ -125,7 +125,7 @@ class CarlaInterface:
     def __init__(self, mpc_params):
         self.mpc_params = mpc_params
         self.client = carla.Client('localhost', 2000)
-        self.client.set_timeout(20.0)  # Increased timeout
+        self.client.set_timeout(20.0)
         
         try:
             self.world = self.client.get_world()
@@ -142,7 +142,7 @@ class CarlaInterface:
             self.setup_visualization()
             
             self.collision_count = 0
-            self.max_collisions = 2  # Fewer allowed collisions
+            self.max_collisions = 2
             self.last_steer = 0.0
             self.waypoints = []
             
@@ -155,29 +155,34 @@ class CarlaInterface:
         """Find a long straight road segment"""
         spawn_points = self.map.get_spawn_points()
         
-        # Find spawn points with clear path ahead
+        # Prefer highway spawn points
+        highway_spawns = [sp for sp in spawn_points 
+                         if self.map.get_waypoint(sp.location).is_junction == False]
+        
+        if not highway_spawns:
+            highway_spawns = spawn_points
+        
+        # Find spawn point with straight path ahead
         best_spawn = None
         max_straight_distance = 0
         
-        for sp in spawn_points:
+        for sp in highway_spawns:
             wp = self.map.get_waypoint(sp.location)
-            straight_dist = self.check_straight_path(wp, distance=50.0)
+            straight_dist = self.check_straight_path(wp, distance=100.0)
             if straight_dist > max_straight_distance:
                 max_straight_distance = straight_dist
                 best_spawn = sp
         
         if not best_spawn:
-            best_spawn = random.choice(spawn_points)
+            best_spawn = random.choice(highway_spawns)
         
-        # Spawn vehicle
+        # Spawn vehicle without physics control attribute
         vehicle_bp = self.blueprint_library.find('vehicle.tesla.model3')
-        vehicle_bp.set_attribute('enable_physics_control', 'true')
-        
         self.vehicle = self.world.spawn_actor(vehicle_bp, best_spawn)
         self.vehicle.set_autopilot(False)
         
-        # Generate waypoints for reference path
-        self.generate_waypoints_ahead(100.0)
+        # Generate waypoints
+        self.generate_waypoints_ahead(150.0)
         
         # Set spectator
         self.spectator = self.world.get_spectator()
@@ -215,7 +220,7 @@ class CarlaInterface:
     def get_reference_state(self):
         """Get reference state from waypoints"""
         if not self.waypoints:
-            return np.array([0.0, 0.0, 0.0, 0.0])  # Default to straight
+            return np.array([0.0, 0.0, 0.0, 0.0])
         
         # Find closest waypoint
         vehicle_loc = self.vehicle.get_location()
@@ -235,8 +240,8 @@ class CarlaInterface:
             
         transform = self.vehicle.get_transform()
         self.spectator.set_transform(carla.Transform(
-            transform.location + carla.Location(x=-10, z=3),
-            carla.Rotation(yaw=180, pitch=-15)
+            transform.location + carla.Location(x=-15, z=5),
+            carla.Rotation(yaw=180, pitch=-20)
         ))
 
     def get_vehicle_state(self):
@@ -255,7 +260,7 @@ class CarlaInterface:
         return np.array([beta, psi_dot, psi, y])
 
     def handle_collision(self, event):
-        """More robust collision recovery"""
+        """Improved collision recovery"""
         self.collision_count += 1
         print(f"Collision #{self.collision_count} with {event.other_actor.type_id}")
         
@@ -264,7 +269,7 @@ class CarlaInterface:
             self.should_stop = True
             return
             
-        # Full reset of vehicle state
+        # Reset vehicle state
         current_transform = self.vehicle.get_transform()
         reset_location = carla.Location(
             x=current_transform.location.x,
@@ -272,24 +277,23 @@ class CarlaInterface:
             z=current_transform.location.z + 0.5
         )
         
-        # Create new transform with reset location but same orientation
         reset_transform = carla.Transform(
             reset_location,
             current_transform.rotation
         )
         
-        # Reset vehicle
         self.vehicle.set_transform(reset_transform)
         
-        # Properly stop the vehicle using physics control
-        physics_control = self.vehicle.get_physics_control()
-        physics_control.throttle = 0.0
-        physics_control.brake = 1.0
-        physics_control.steer = 0.0
-        self.vehicle.apply_physics_control(physics_control)
+        # Stop the vehicle
+        control = carla.VehicleControl()
+        control.throttle = 0.0
+        control.brake = 1.0
+        control.steer = 0.0
+        self.vehicle.apply_control(control)
         
         # Regenerate waypoints
         self.generate_waypoints_ahead(100.0)
+        time.sleep(1.0)  # Pause after collision
 
     def apply_control(self, steer):
         """Smooth, limited control application"""
@@ -297,20 +301,14 @@ class CarlaInterface:
         smoothed_steer = 0.7 * self.last_steer + 0.3 * steer
         self.last_steer = smoothed_steer
         
-        # Create vehicle control
+        # Create and apply control
         control = carla.VehicleControl()
         control.steer = np.clip(smoothed_steer, 
                                -self.mpc_params.max_steer, 
                                self.mpc_params.max_steer)
         control.throttle = 0.3
         control.brake = 0.0
-        
-        # Apply with physics control for better stability
-        physics_control = self.vehicle.get_physics_control()
-        physics_control.throttle = control.throttle
-        physics_control.brake = control.brake
-        physics_control.steer = control.steer
-        self.vehicle.apply_physics_control(physics_control)
+        self.vehicle.apply_control(control)
 
     def run_simulation(self, controller, duration=30.0):
         self.should_stop = False
