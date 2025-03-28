@@ -188,68 +188,46 @@ class CarlaInterface:
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
         
-        # Get world and set synchronous mode for better control
+        # Get world and set synchronous mode
         self.world = self.client.get_world()
         settings = self.world.get_settings()
-        settings.synchronous_mode = True  # Enables synchronous mode
+        settings.synchronous_mode = True
         settings.fixed_delta_seconds = self.mpc_params.dt
         self.world.apply_settings(settings)
         
         # Get blueprint library
         self.blueprint_library = self.world.get_blueprint_library()
         
-        # Setup visualization
-        self.setup_visualization()
+        # Initialize visualization structures
+        self.display = None
+        self.spectator = None
+        self.collision_sensor = None
+        self.lane_sensor = None
         
-        # Spawn vehicle
+        # First spawn the vehicle
         self.spawn_vehicle()
+        
+        # Then setup visualization that depends on the vehicle
+        self.setup_visualization()
         
         # For plotting
         self.time_history = []
         self.state_history = []
         self.control_history = []
     
-    def setup_visualization(self):
-        """Set up CARLA's spectator view and other visualization elements"""
-        # Add a spectator camera that follows the vehicle
-        spectator = self.world.get_spectator()
-        
-        # Set spectator to follow the vehicle (we'll update this in run_simulation)
-        self.spectator = spectator
-        
-        # Add a collision sensor to detect crashes
-        collision_bp = self.blueprint_library.find('sensor.other.collision')
-        self.collision_sensor = self.world.spawn_actor(
-            collision_bp,
-            carla.Transform(),
-            attach_to=self.vehicle
-        )
-        self.collision_sensor.listen(lambda event: print(f"Collision detected with {event.other_actor.type_id}"))
-        
-        # Initialize pygame for additional visualization
-        pygame.init()
-        self.display = pygame.display.set_mode(
-            (800, 600),
-            pygame.HWSURFACE | pygame.DOUBLEBUF
-        )
-        pygame.display.set_caption("CARLA MPC Control Visualization")
-      
     def spawn_vehicle(self):
-        """Spawn the vehicle and necessary sensors"""
-        # Find a spawn point
+        """Spawn the vehicle first"""
         spawn_points = self.world.get_map().get_spawn_points()
-        spawn_point = spawn_points[0]  # choose first spawn point
+        spawn_point = spawn_points[0]
         
-        # Get vehicle blueprint
         vehicle_bp = self.blueprint_library.find('vehicle.tesla.model3')
-        
-        # Spawn the vehicle
         self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
-        
-        # Set autopilot off
         self.vehicle.set_autopilot(False)
         
-        # Add a RGB camera for visualization
+        # Initialize spectator
+        self.spectator = self.world.get_spectator()
+        
+        # Add RGB camera
         camera_bp = self.blueprint_library.find('sensor.camera.rgb')
         camera_bp.set_attribute('image_size_x', '800')
         camera_bp.set_attribute('image_size_y', '600')
@@ -259,31 +237,64 @@ class CarlaInterface:
             camera_transform,
             attach_to=self.vehicle
         )
-        
-        # Add a lane invasion sensor
-        lane_bp = self.blueprint_library.find('sensor.other.lane_invasion')
-        self.lane_sensor = self.world.spawn_actor(
-            lane_bp,
-            carla.Transform(),
-            attach_to=self.vehicle
-        )
-        self.lane_sensor.listen(lambda event: print(f"Lane invasion detected: {event}"))
-
+    
+    def setup_visualization(self):
+        """Setup visualization after vehicle exists"""
+        try:
+            # Initialize pygame
+            pygame.init()
+            self.display = pygame.display.set_mode(
+                (800, 600),
+                pygame.HWSURFACE | pygame.DOUBLEBUF
+            )
+            pygame.display.set_caption("CARLA MPC Control Visualization")
+            
+            # Add collision sensor
+            collision_bp = self.blueprint_library.find('sensor.other.collision')
+            self.collision_sensor = self.world.spawn_actor(
+                collision_bp,
+                carla.Transform(),
+                attach_to=self.vehicle
+            )
+            self.collision_sensor.listen(lambda event: print(f"Collision with {event.other_actor.type_id}"))
+            
+            # Add lane invasion sensor
+            lane_bp = self.blueprint_library.find('sensor.other.lane_invasion')
+            self.lane_sensor = self.world.spawn_actor(
+                lane_bp,
+                carla.Transform(),
+                attach_to=self.vehicle
+            )
+            self.lane_sensor.listen(lambda event: print("Lane invasion detected"))
+            
+        except Exception as e:
+            print(f"Visualization setup error: {e}")
+            self.cleanup()
+            raise
+    
     def update_visualization(self):
-        """Update the spectator view and pygame display"""
-        # Update spectator to follow vehicle
-        transform = self.vehicle.get_transform()
-        self.spectator.set_transform(carla.Transform(
-            transform.location + carla.Location(z=50),  # 50m above
-            carla.Rotation(pitch=-90)  # Look straight down
-        ))
-        
-        # Update pygame display
-        pygame.display.flip()
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                return False
-        return True
+        """Update the visualization"""
+        if not self.vehicle:
+            return False
+            
+        try:
+            # Update spectator view
+            transform = self.vehicle.get_transform()
+            self.spectator.set_transform(carla.Transform(
+                transform.location + carla.Location(z=50),
+                carla.Rotation(pitch=-90)
+            ))
+            
+            # Handle pygame events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            print(f"Visualization update error: {e}")
+            return False
         
     def add_camera(self):
         # Add a RGB camera
@@ -387,6 +398,19 @@ class CarlaInterface:
         
         plt.tight_layout()
         plt.show()
+
+    def cleanup(self):
+        """Proper cleanup of all actors"""
+        if hasattr(self, 'lane_sensor') and self.lane_sensor:
+            self.lane_sensor.destroy()
+        if hasattr(self, 'collision_sensor') and self.collision_sensor:
+            self.collision_sensor.destroy()
+        if hasattr(self, 'camera') and self.camera:
+            self.camera.destroy()
+        if hasattr(self, 'vehicle') and self.vehicle:
+            self.vehicle.destroy()
+        if pygame.get_init():
+            pygame.quit()
 
 # Main function
 def main():
