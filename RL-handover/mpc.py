@@ -3,6 +3,7 @@ import numpy as np
 from casadi import *
 import random
 import time
+import math
 
 class VehicleParams:
     def __init__(self):
@@ -19,7 +20,7 @@ class MPCParams:
         self.N = 10           # prediction horizon
         self.dt = 0.1         # time step [s]
         self.max_iter = 100   # maximum iterations
-        self.max_steer = np.deg2rad(3)  # very conservative steering limit
+        self.max_steer = np.deg2rad(10)  # very conservative steering limit
 
 class MPCController:
     def __init__(self, vehicle_params, mpc_params):
@@ -325,7 +326,7 @@ class CarlaInterface:
         control.brake = 0.0
         self.vehicle.apply_control(control)
 
-    def run_simulation(self, controller, duration=30.0):
+    def run_simulation(self, controller, duration=15.0):
         self.should_stop = False
         start_time = time.time()
         
