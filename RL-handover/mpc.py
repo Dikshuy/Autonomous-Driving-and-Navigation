@@ -20,7 +20,7 @@ class MPCParams:
         self.N = 10           # prediction horizon
         self.dt = 0.1         # time step [s]
         self.max_iter = 100   # maximum iterations
-        self.max_steer = np.deg2rad(10)  # very conservative steering limit
+        self.max_steer = np.deg2rad(3)  # very conservative steering limit
 
 class MPCController:
     def __init__(self, vehicle_params, mpc_params):
@@ -241,8 +241,8 @@ class CarlaInterface:
             
         transform = self.vehicle.get_transform()
         self.spectator.set_transform(carla.Transform(
-            transform.location + carla.Location(x=-15, z=5),
-            carla.Rotation(yaw=180, pitch=-20)
+            transform.location + carla.Location(x=-10, z=4),
+            carla.Rotation(yaw=0, pitch=-10)
         ))
 
     def setup_visualization(self):
@@ -317,7 +317,7 @@ class CarlaInterface:
         control.steer = np.clip(smoothed_steer, 
                                -self.mpc_params.max_steer, 
                                self.mpc_params.max_steer)
-        control.throttle = 0.3
+        control.throttle = 0.14
         control.brake = 0.0
         self.vehicle.apply_control(control)
 
