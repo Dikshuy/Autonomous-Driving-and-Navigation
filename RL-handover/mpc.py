@@ -3,6 +3,7 @@ import numpy as np
 from casadi import *
 import random
 import time
+import math
 
 class VehicleParams:
     def __init__(self):
@@ -142,8 +143,9 @@ class CarlaInterface:
             self.attempt_spawn_vehicle()
             
             if not self.vehicle:
-                raise RuntimeError("Failed to spawn vehicle after multiple attempts")
+                raise RuntimeError("Failed to spawn vehicle")
                 
+            self.setup_cameras()  # New multi-camera setup
             self.setup_visualization()
             
             self.collision_count = 0
@@ -156,31 +158,115 @@ class CarlaInterface:
             self.cleanup()
             raise
 
-    def attempt_spawn_vehicle(self, max_attempts=10):
-        """Robust vehicle spawning with collision checks"""
+    def setup_cameras(self):
+        """Setup multiple camera views"""
+        # 1. Chase camera (third-person view)
+        chase_camera_bp = self.blueprint_library.find('sensor.camera.rgb')
+        chase_camera_bp.set_attribute('image_size_x', '800')
+        chase_camera_bp.set_attribute('image_size_y', '600')
+        chase_transform = carla.Transform(
+            carla.Location(x=-8, z=4),  # 8m behind, 4m up
+            carla.Rotation(pitch=-15)   # Slightly looking down
+        )
+        self.chase_camera = self.world.spawn_actor(
+            chase_camera_bp,
+            chase_transform,
+            attach_to=self.vehicle
+        )
+        
+        # 2. Dashboard camera (first-person view)
+        dash_camera_bp = self.blueprint_library.find('sensor.camera.rgb')
+        dash_camera_bp.set_attribute('image_size_x', '800')
+        dash_camera_bp.set_attribute('image_size_y', '600')
+        dash_transform = carla.Transform(
+            carla.Location(x=1.5, z=1.7),  # Driver's eye view
+            carla.Rotation(pitch=5)        # Slight downward tilt
+        )
+        self.dash_camera = self.world.spawn_actor(
+            dash_camera_bp,
+            dash_transform,
+            attach_to=self.vehicle
+        )
+        
+        # 3. Top-down view (for context)
+        top_camera_bp = self.blueprint_library.find('sensor.camera.rgb')
+        top_camera_bp.set_attribute('image_size_x', '800')
+        top_camera_bp.set_attribute('image_size_y', '600')
+        top_transform = carla.Transform(
+            carla.Location(z=50),  # 50m above
+            carla.Rotation(pitch=-90)  # Straight down
+        )
+        self.top_camera = self.world.spawn_actor(
+            top_camera_bp,
+            top_transform,
+            attach_to=self.vehicle
+        )
+        
+        # Set spectator to follow chase camera initially
+        self.spectator = self.world.get_spectator()
+        self.current_camera_view = "chase"
+        self.update_spectator_view()
+
+    def update_spectator_view(self):
+        """Cycle through camera views"""
+        if self.current_camera_view == "chase":
+            transform = self.chase_camera.get_transform()
+            self.spectator.set_transform(transform)
+        elif self.current_camera_view == "dash":
+            transform = self.dash_camera.get_transform()
+            self.spectator.set_transform(transform)
+        elif self.current_camera_view == "top":
+            transform = self.top_camera.get_transform()
+            self.spectator.set_transform(transform)
+
+    def cycle_camera_view(self):
+        """Switch between camera views"""
+        views = ["chase", "dash", "top"]
+        current_idx = views.index(self.current_camera_view)
+        self.current_camera_view = views[(current_idx + 1) % len(views)]
+        self.update_spectator_view()
+        print(f"Switched to {self.current_camera_view} view")
+
+    def setup_visualization(self):
+        """Setup debug drawing and collision sensor"""
+        # Add collision sensor
+        collision_bp = self.blueprint_library.find('sensor.other.collision')
+        self.collision_sensor = self.world.spawn_actor(
+            collision_bp,
+            carla.Transform(),
+            attach_to=self.vehicle
+        )
+        self.collision_sensor.listen(self.handle_collision)
+        
+        # Add keyboard listener for camera switching
+        if hasattr(self, 'world'):
+            self.world.on_tick(lambda _: self.check_for_camera_switch())
+
+    def check_for_camera_switch(self):
+        """Check for camera switch input"""
+        keys = self.world.get_snapshot().keys
+        if keys & carla.KeyEvent.Tilde:  # Tilde key (~)
+            self.cycle_camera_view()
+
+    def attempt_spawn_vehicle(self):
+        """Spawn vehicle at a clear location"""
         spawn_points = self.map.get_spawn_points()
-        random.shuffle(spawn_points)  # Try spawn points in random order
+        random.shuffle(spawn_points)
         
-        for attempt in range(max_attempts):
-            for spawn_point in spawn_points:
-                try:
-                    # Check if spawn point is clear
-                    if self.is_spawn_point_clear(spawn_point.location):
-                        vehicle_bp = self.blueprint_library.find('vehicle.tesla.model3')
-                        self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
-                        
-                        if self.vehicle:
-                            self.vehicle.set_autopilot(False)
-                            print(f"Successfully spawned vehicle at {spawn_point.location}")
-                            self.generate_waypoints_ahead(150.0)
-                            return
-                            
-                except Exception as e:
-                    print(f"Spawn attempt {attempt+1} failed: {e}")
+        for spawn_point in spawn_points:
+            vehicle_bp = self.blueprint_library.find('vehicle.tesla.model3')
+            self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+            if self.vehicle:
+                self.vehicle.set_autopilot(False)
+                print(f"Spawned vehicle at {spawn_point.location}")
+                self.generate_waypoints_ahead(150.0)
+                return
         
-        print("Warning: Using forced spawn - may collide with objects")
-        vehicle_bp = self.blueprint_library.find('vehicle.tesla.model3')
-        self.vehicle = self.world.spawn_actor(vehicle_bp, random.choice(spawn_points))
+        # Fallback if no clear spawn found
+        self.vehicle = self.world.spawn_actor(
+            self.blueprint_library.find('vehicle.tesla.model3'),
+            random.choice(spawn_points)
+        )
         self.vehicle.set_autopilot(False)
 
     def is_spawn_point_clear(self, location, radius=3.0):
@@ -329,18 +415,6 @@ class CarlaInterface:
         self.should_stop = False
         start_time = time.time()
         
-        # Add collision sensor
-        collision_bp = self.blueprint_library.find('sensor.other.collision')
-        self.collision_sensor = self.world.spawn_actor(
-            collision_bp,
-            carla.Transform(),
-            attach_to=self.vehicle
-        )
-        self.collision_sensor.listen(self.handle_collision)
-        
-        # Set spectator
-        self.spectator = self.world.get_spectator()
-        
         try:
             while (time.time() - start_time) < duration and not self.should_stop:
                 self.world.tick()
@@ -349,12 +423,11 @@ class CarlaInterface:
                 x0 = self.get_vehicle_state()
                 x_ref = self.get_reference_state()
                 
-                # Solve MPC
+                # Solve MPC and apply control
                 steer = controller.solve_mpc(x0, x_ref)
                 self.apply_control(steer)
                 
-                # Visual updates
-                self.update_spectator_view()
+                # Update visualization
                 self.debug_draw_waypoints()
                 
                 time.sleep(0.01)
@@ -377,9 +450,15 @@ class CarlaInterface:
             )
 
     def cleanup(self):
-        """Proper cleanup of all actors"""
+        """Clean up all actors"""
+        cameras = [self.chase_camera, self.dash_camera, self.top_camera]
+        for camera in cameras:
+            if camera and camera.is_alive:
+                camera.destroy()
+        
         if hasattr(self, 'collision_sensor') and self.collision_sensor:
             self.collision_sensor.destroy()
+        
         if hasattr(self, 'vehicle') and self.vehicle:
             self.vehicle.destroy()
         
@@ -397,7 +476,8 @@ def main():
         controller = MPCController(vehicle_params, mpc_params)
         carla_interface = CarlaInterface(mpc_params)
         
-        print("Starting stable MPC simulation...")
+        print("Starting MPC simulation with enhanced visualization...")
+        print("Press ~ (tilde) key to switch camera views")
         carla_interface.run_simulation(controller, duration=30.0)
         
     except KeyboardInterrupt:
