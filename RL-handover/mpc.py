@@ -244,6 +244,16 @@ class CarlaInterface:
             carla.Rotation(yaw=180, pitch=-20)
         ))
 
+    def setup_visualization(self):
+        # Add camera
+        camera_bp = self.blueprint_library.find('sensor.camera.rgb')
+        camera_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
+        self.camera = self.world.spawn_actor(
+            camera_bp,
+            camera_transform,
+            attach_to=self.vehicle
+        )
+
     def get_vehicle_state(self):
         """Get current vehicle state: [β, ψ_dot, ψ, y]"""
         transform = self.vehicle.get_transform()
