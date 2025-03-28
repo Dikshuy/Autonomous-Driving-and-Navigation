@@ -145,8 +145,8 @@ class MPCController:
         self.ubx = [inf] * (4*(N+1)) + [self.mpc_params.max_steer] * N
         
         # Constraint bounds
-        # 1 initial condition constraint + N dynamics constraints
-        num_constraints = 4 + 4*N  # 4 for initial condition, 4 for each dynamics constraint
+        # 1 initial condition constraint (4 eq) + N dynamics constraints (4 eq each)
+        num_constraints = 4 + 4*N
         self.lbg = [0] * num_constraints
         self.ubg = [0] * num_constraints
         
@@ -180,7 +180,9 @@ class MPCController:
 
 # Carla interface class
 class CarlaInterface:
-    def __init__(self):
+    def __init__(self, mpc_params):
+        self.mpc_params = mpc_params  # Store MPC parameters
+        
         # Connect to Carla server
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
@@ -221,9 +223,6 @@ class CarlaInterface:
         camera_bp = self.blueprint_library.find('sensor.camera.rgb')
         camera_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
         self.camera = self.world.spawn_actor(camera_bp, camera_transform, attach_to=self.vehicle)
-        
-        # For visualization (optional)
-        # You would normally process the camera data here
         
     def get_vehicle_state(self):
         # Get current vehicle state
@@ -320,7 +319,7 @@ def main():
         controller = MPCController(vehicle_params, mpc_params)
         
         # Connect to Carla and run simulation
-        carla_interface = CarlaInterface()
+        carla_interface = CarlaInterface(mpc_params)  # Pass mpc_params here
         carla_interface.run_simulation(controller, duration=20.0)
         
         # Plot results
