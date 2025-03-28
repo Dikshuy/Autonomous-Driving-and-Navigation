@@ -310,6 +310,65 @@ class CarlaInterface:
         control.brake = 0.0
         self.vehicle.apply_control(control)
 
+    def setup_visualization(self):
+        """Setup visualization after vehicle exists"""
+        try:
+            # Initialize pygame
+            pygame.init()
+            self.display = pygame.display.set_mode(
+                (800, 600),
+                pygame.HWSURFACE | pygame.DOUBLEBUF
+            )
+            pygame.display.set_caption("CARLA MPC Control Visualization")
+            
+            # Add collision sensor
+            collision_bp = self.blueprint_library.find('sensor.other.collision')
+            self.collision_sensor = self.world.spawn_actor(
+                collision_bp,
+                carla.Transform(),
+                attach_to=self.vehicle
+            )
+            self.collision_sensor.listen(lambda event: print(f"Collision with {event.other_actor.type_id}"))
+            
+            # Add lane invasion sensor
+            lane_bp = self.blueprint_library.find('sensor.other.lane_invasion')
+            self.lane_sensor = self.world.spawn_actor(
+                lane_bp,
+                carla.Transform(),
+                attach_to=self.vehicle
+            )
+            self.lane_sensor.listen(lambda event: print("Lane invasion detected"))
+            
+        except Exception as e:
+            print(f"Visualization setup error: {e}")
+            self.cleanup()
+            raise
+    
+    def update_visualization(self):
+        """Update the visualization"""
+        if not self.vehicle:
+            return False
+            
+        try:
+            # Update spectator view
+            transform = self.vehicle.get_transform()
+            self.spectator.set_transform(carla.Transform(
+                transform.location + carla.Location(z=50),
+                carla.Rotation(pitch=-90)
+            ))
+            
+            # Handle pygame events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            print(f"Visualization update error: {e}")
+            return False
+    
+
     def cleanup(self):
         """Clean up all actors"""
         actors = [
