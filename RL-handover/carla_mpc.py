@@ -31,8 +31,8 @@ class BicycleMPCCarla:
     def __init__(
         self, 
         wheelbase: float = 2.5, 
-        velocity: float = 7.0, 
-        horizon_length: int = 15,  # Increased horizon for better prediction
+        velocity: float = 5.0,  # Reduced from 7.0 for better stability
+        horizon_length: int = 10,  # Reduced for faster computation
         time_step: float = 0.1
     ):
         self.L = wheelbase
@@ -40,11 +40,12 @@ class BicycleMPCCarla:
         self.N = horizon_length
         self.dt = time_step
         
-        # State cost matrix (position tracking) - Adjusted weights
-        self.Q = np.diag([20.0, 20.0, 5.0])  # Higher weights for x,y tracking, moderate for heading
+        # State cost matrix - Adjusted weights for smoother operation
+        # Reduced heading weight significantly to prevent oversteering
+        self.Q = np.diag([10.0, 10.0, 1.0])  # [x, y, theta]
         
-        # Control cost matrix (steering angle) - Increased to penalize aggressive steering
-        self.R = np.diag([5.0])
+        # Control cost matrix - Increased to penalize aggressive steering more
+        self.R = np.diag([15.0])  # Significantly higher to reduce steering oscillations
         
         # Setup the optimization problem
         self.setup_optimization()
@@ -77,12 +78,19 @@ class BicycleMPCCarla:
             current_state = self.X[:, k]
             control_input = self.U[:, k]
             
-            # Reference tracking cost - consider heading alignment with path
+            # Reference tracking cost
             target_x = self.target_param[0, k]
             target_y = self.target_param[1, k]
             
-            # Estimate target heading if not the last point
-            if k < self.N - 1:
+            # Estimate target heading direction from future points with smoothing
+            if k < self.N - 2:  # If at least 2 more points ahead
+                # Calculate heading from multiple future points for stability
+                next_x = (self.target_param[0, k + 1] + self.target_param[0, k + 2]) / 2
+                next_y = (self.target_param[1, k + 1] + self.target_param[1, k + 2]) / 2
+                dx = next_x - target_x
+                dy = next_y - target_y
+                target_heading = ca.atan2(dy, dx)
+            elif k < self.N - 1:  # If 1 more point ahead
                 next_x = self.target_param[0, k + 1]
                 next_y = self.target_param[1, k + 1]
                 dx = next_x - target_x
@@ -90,40 +98,56 @@ class BicycleMPCCarla:
                 target_heading = ca.atan2(dy, dx)
             else:
                 # For the last point, use the same heading as previous
-                target_heading = 0
+                if k > 0:
+                    prev_x = self.target_param[0, k - 1]
+                    prev_y = self.target_param[1, k - 1]
+                    dx = target_x - prev_x
+                    dy = target_y - prev_y
+                    target_heading = ca.atan2(dy, dx)
+                else:
+                    target_heading = 0
                 
-            target = ca.vertcat(target_x, target_y, target_heading)
-            tracking_error = current_state - target
-            state_cost = ca.mtimes(tracking_error.T, self.Q @ tracking_error)
+            # Position cost - only track x, y position
+            position_error = current_state[:2] - ca.vertcat(target_x, target_y)
+            position_cost = ca.mtimes(position_error.T, ca.mtimes(self.Q[:2,:2], position_error))
             
-            # Control cost
+            # Heading cost - track estimated heading direction
+            heading_error = (current_state[2] - target_heading)
+            # Normalize angle difference to [-pi, pi]
+            heading_error = ca.if_else(heading_error > ca.pi, heading_error - 2*ca.pi,
+                                      ca.if_else(heading_error < -ca.pi, heading_error + 2*ca.pi, heading_error))
+            heading_cost = self.Q[2,2] * (heading_error**2)
+            
+            # Control cost - penalize large steering angles
             control_cost = ca.mtimes(control_input.T, self.R @ control_input)
             
             # Add to objective
-            objective += state_cost + control_cost
+            objective += position_cost + heading_cost + control_cost
             
-            # Add rate of change penalty for smoother control
+            # Add strong rate of change penalty for smoother control
             if k < self.N - 1:
                 next_control = self.U[:, k+1]
-                smoothness_cost = 15.0 * ca.sumsqr(next_control - control_input)  # Increased weight for smoother steering
+                smoothness_cost = 30.0 * ca.sumsqr(next_control - control_input)  # Significantly increased
                 objective += smoothness_cost
             
             # System dynamics constraint
             self.opti.subject_to(self.X[:, k+1] == self.bicycle_model(self.X[:, k], self.U[:, k]))
         
-        # Steering angle constraints - reduced slightly for more stable control
-        self.opti.subject_to(self.opti.bounded(-np.pi/5, self.U[0, :], np.pi/5))
+        # Steering angle constraints - reduced for more stable control
+        # Using pi/6 (30 degrees) instead of pi/5 (36 degrees)
+        self.opti.subject_to(self.opti.bounded(-np.pi/6, self.U[0, :], np.pi/6))
         
         # Set objective and solver
         self.opti.minimize(objective)
         
-        # Set solver options - increased max_iter for better convergence
+        # Set solver options - adjusted for stability
         opts = {
             'ipopt.print_level': 0,
             'ipopt.sb': 'yes',
             'print_time': 0,
-            'ipopt.max_iter': 100,  # Increased max iterations
-            'ipopt.tol': 1e-4       # Tighter tolerance
+            'ipopt.max_iter': 100,
+            'ipopt.tol': 1e-3,        # Slightly relaxed tolerance
+            'ipopt.acceptable_tol': 1e-2  # Allow earlier termination
         }
         self.opti.solver('ipopt', opts)
 
@@ -190,9 +214,9 @@ class CarlaMPCLaneFollower:
         client_port: int = 2000,
         fixed_delta_seconds: float = 0.05,
         wheelbase: float = 2.5,
-        target_speed: float = 5.0,  # Reduced speed for more stability
-        horizon_length: int = 15,   # Increased horizon
-        lookahead_distance: float = 25.0,  # Extended lookahead for better path planning
+        target_speed: float = 4.0,  # Further reduced speed for better stability
+        horizon_length: int = 10,   # Reduced horizon for faster computation
+        lookahead_distance: float = 15.0,  # Reduced lookahead for more precise tracking
         debug_mode: bool = True
     ):
         # Connect to CARLA
@@ -244,11 +268,11 @@ class CarlaMPCLaneFollower:
         self.error_counter = 0
         self.max_errors = 5
         
-        # For speed PID control
+        # For speed PID control - adjusted gains for smoother acceleration
         self.speed_error_sum = 0.0
         self.last_speed_error = 0.0
-        self.kp_speed = 0.5
-        self.ki_speed = 0.1
+        self.kp_speed = 0.3  # Reduced from 0.5
+        self.ki_speed = 0.05  # Reduced from 0.1
         self.kd_speed = 0.1
         
     def find_good_spawn_points(self, num_points=10):
@@ -275,7 +299,7 @@ class CarlaMPCLaneFollower:
                 # Check if road is relatively straight by comparing headings
                 if len(next_waypoints) >= 3:
                     headings = [wp.transform.rotation.yaw for wp in next_waypoints]
-                    max_heading_diff = max([abs(headings[i] - headings[i+1]) for i in range(len(headings)-1)])
+                    max_heading_diff = max([abs((headings[i] - headings[i+1] + 180) % 360 - 180) for i in range(len(headings)-1)])
                     
                     # If the heading doesn't change much, it's a good point
                     if max_heading_diff < 5.0:
@@ -300,9 +324,11 @@ class CarlaMPCLaneFollower:
         if spawn_point_idx is None:
             good_points = self.find_good_spawn_points()
             if good_points:
+                # Use the first good point found
                 spawn_point_idx = good_points[0][0]
                 print(f"Using automatically selected good spawn point at index {spawn_point_idx}")
             else:
+                # If no good points found, use a default
                 spawn_point_idx = 0
         
         # Choose a spawn point
@@ -339,6 +365,8 @@ class CarlaMPCLaneFollower:
         # Convert from CARLA's coordinate system to our MPC coordinate system
         x = location.x
         y = location.y
+        
+        # Convert yaw from degrees to radians
         theta = np.radians(rotation.yaw)
         
         return np.array([x, y, theta])
@@ -421,6 +449,8 @@ class CarlaMPCLaneFollower:
         # PID control
         p_term = self.kp_speed * speed_error
         self.speed_error_sum += speed_error * self.dt
+        # Anti-windup - limit integral term
+        self.speed_error_sum = np.clip(self.speed_error_sum, -10.0, 10.0)
         i_term = self.ki_speed * self.speed_error_sum
         d_term = self.kd_speed * (speed_error - self.last_speed_error) / self.dt
         self.last_speed_error = speed_error
@@ -430,18 +460,20 @@ class CarlaMPCLaneFollower:
         
         # Determine throttle and brake based on control signal
         if throttle_raw > 0:
-            throttle = min(max(throttle_raw, 0.0), 1.0)
+            # More gradual throttle application
+            throttle = min(max(throttle_raw, 0.0), 0.7)  # Cap throttle at 0.7
             brake = 0.0
         else:
             throttle = 0.0
-            brake = min(max(-throttle_raw * 0.5, 0.0), 1.0)  # Scale brake to be less aggressive
+            # More gradual braking
+            brake = min(max(-throttle_raw * 0.3, 0.0), 0.5)  # Scale brake even lower
         
         return throttle, brake
     
     def apply_control(self, steering_angle):
         """Apply control to the vehicle based on MPC output."""
-        # Add steering smoothing to prevent jerky movements
-        alpha = 0.3  # Smoothing factor (adjust as needed)
+        # Add strong steering smoothing to prevent jerky movements
+        alpha = 0.15  # Very low alpha (more smoothing)
         smoothed_steering = alpha * steering_angle + (1 - alpha) * self.last_steering_angle
         self.last_steering_angle = smoothed_steering
         
@@ -469,6 +501,32 @@ class CarlaMPCLaneFollower:
         
         return control
     
+    def preprocess_reference_trajectory(self, reference_trajectory):
+        """Preprocess the reference trajectory to ensure smooth tracking."""
+        # If not enough points, duplicate the last one
+        if reference_trajectory.shape[1] < self.mpc.N:
+            last_point = reference_trajectory[:, -1:]
+            missing = self.mpc.N - reference_trajectory.shape[1]
+            reference_trajectory = np.hstack([reference_trajectory, np.tile(last_point, (1, missing))])
+        else:
+            # Trim if we have too many
+            reference_trajectory = reference_trajectory[:, :self.mpc.N]
+        
+        # Ensure the path is smooth using a simple moving average filter
+        if reference_trajectory.shape[1] >= 3:
+            smoothed_trajectory = np.copy(reference_trajectory)
+            
+            # Apply moving average to smooth path
+            for i in range(1, reference_trajectory.shape[1]-1):
+                # For each x, y, apply a 3-point moving average
+                smoothed_trajectory[:, i] = (reference_trajectory[:, i-1] + 
+                                             reference_trajectory[:, i] + 
+                                             reference_trajectory[:, i+1]) / 3.0
+            
+            return smoothed_trajectory
+        
+        return reference_trajectory
+    
     def run_step(self):
         """Run a single step of the MPC controller."""
         try:
@@ -489,15 +547,8 @@ class CarlaMPCLaneFollower:
             # Convert waypoints to reference trajectory
             reference_trajectory = self.convert_waypoints_to_array(waypoints)
             
-            # Ensure we have enough waypoints for the MPC horizon
-            if reference_trajectory.shape[1] < self.mpc.N:
-                # Duplicate the last waypoint if we don't have enough
-                last_point = reference_trajectory[:, -1:]
-                missing = self.mpc.N - reference_trajectory.shape[1]
-                reference_trajectory = np.hstack([reference_trajectory, np.tile(last_point, (1, missing))])
-            else:
-                # Trim if we have too many
-                reference_trajectory = reference_trajectory[:, :self.mpc.N]
+            # Preprocess and smooth the reference trajectory
+            reference_trajectory = self.preprocess_reference_trajectory(reference_trajectory)
             
             # Solve MPC problem
             steering_angle, predicted_traj = self.mpc.solve(current_state, reference_trajectory)
@@ -585,8 +636,8 @@ class CarlaMPCLaneFollower:
         time_steps = np.arange(len(self.steering_commands)) * self.dt
         plt.plot(time_steps, self.steering_commands, label='Steering Angle (rad)')
         # Add lines at the steering limits
-        plt.axhline(y=np.pi/4, color='r', linestyle='--', alpha=0.5, label='Steering Limits')
-        plt.axhline(y=-np.pi/4, color='r', linestyle='--', alpha=0.5)
+        plt.axhline(y=np.pi/6, color='r', linestyle='--', alpha=0.5, label='Steering Limits')
+        plt.axhline(y=-np.pi/6, color='r', linestyle='--', alpha=0.5)
         plt.title('Steering Commands over Time')
         plt.xlabel('Time (s)')
         plt.ylabel('Steering Angle (rad)')
@@ -610,6 +661,7 @@ class CarlaMPCLaneFollower:
         self.predicted_trajectories = []
         self.speed_error_sum = 0.0
         self.last_speed_error = 0.0
+        self.last_steering_angle = 0.0  # Important to reset this!
         self.error_counter = 0
         
         try:
