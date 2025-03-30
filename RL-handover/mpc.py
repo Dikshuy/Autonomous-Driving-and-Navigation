@@ -7,21 +7,21 @@ import math
 
 class VehicleParams:
     def __init__(self):
-        self.m = 1500.0       # mass [kg]
-        self.lf = 1.2         # distance from CG to front axle [m]
-        self.lr = 1.8         # distance from CG to rear axle [m]
-        self.Iz = 3000.0      # yaw moment of inertia [kg*m^2]
-        self.Cf = 70000.0     # front cornering stiffness [N/rad] - adjusted for better handling
-        self.Cr = 80000.0     # rear cornering stiffness [N/rad] - adjusted for better handling
-        self.vx = 8.0         # longitudinal velocity [m/s] - reduced for better control
+        self.m = 1700.0       # mass [kg]
+        self.lf = 1.3         # distance from CG to front axle [m]
+        self.lr = 1.7         # distance from CG to rear axle [m]
+        self.Iz = 3500.0      # yaw moment of inertia [kg*m^2]
+        self.Cf = 80000.0     # reduced cornering stiffness for stability [N/rad]
+        self.Cr = 80000.0     # reduced cornering stiffness for stability [N/rad]
+        self.vx = 5.0         # reduced speed for better control [m/s]
 
 class MPCParams:
     def __init__(self):
-        self.N = 15           # increased prediction horizon for better anticipation
+        self.N = 10           # prediction horizon
         self.dt = 0.1         # time step [s]
         self.max_iter = 100   # maximum iterations
-        self.max_steer = np.deg2rad(25)  # more realistic steering limit [rad]
-        self.steer_rate_limit = np.deg2rad(30) * 0.1  # steering rate limit per time step
+        self.max_steer = np.deg2rad(3)  # conservative steering limit
+        self.steer_smoothing = 0.7      # stronger smoothing
 
 class MPCController:
     def __init__(self, vehicle_params, mpc_params):
@@ -29,186 +29,152 @@ class MPCController:
         self.mpc_params = mpc_params
         self.model = self.create_vehicle_model()
         self.setup_mpc()
-        self.prev_steer = 0.0  # Store previous steering command for rate limiting
+        self.last_steer = 0.0
+        self.last_state = np.zeros(4)
 
     def create_vehicle_model(self):
-        # State: [β (sideslip), ψ_dot (yaw rate), ψ (yaw), y (lateral position), e_y_dot (lateral error derivative)]
-        x = SX.sym('x', 5)
-        # Control input: steering angle δ
-        u = SX.sym('u', 1)
+        x = SX.sym('x', 4)  # [β, ψ_dot, ψ, y]
+        u = SX.sym('u', 1)  # δ
         
         params = self.vehicle_params
         beta = x[0]
         psi_dot = x[1]
         psi = x[2]
         y = x[3]
-        e_y_dot = x[4]  # Added lateral error derivative for better dynamics
         delta = u[0]
         
-        # Improved vehicle dynamics
-        beta_dot = (params.Cf*(delta - beta - (params.lf*psi_dot)/params.vx) + 
-                    params.Cr*(-beta + (params.lr*psi_dot)/params.vx)) / (params.m*params.vx) - psi_dot
+        # Safe vehicle dynamics with numerical stability
+        vx_safe = max(0.1, params.vx)  # Prevent division by zero
         
-        psi_ddot = (params.lf*params.Cf*(delta - beta - (params.lf*psi_dot)/params.vx) - 
-                    params.lr*params.Cr*(-beta + (params.lr*psi_dot)/params.vx)) / params.Iz
+        # Bicycle model with limited inputs
+        a11 = -(params.Cf + params.Cr)/(params.m * vx_safe)
+        a12 = -1 + (params.lr*params.Cr - params.lf*params.Cf)/(params.m * vx_safe**2)
+        a21 = (params.lr*params.Cr - params.lf*params.Cf)/params.Iz
+        a22 = -(params.lf**2 * params.Cf + params.lr**2 * params.Cr)/(params.Iz * vx_safe)
         
-        y_dot = params.vx * (psi + beta)  # Small angle approximation for better numerical stability
+        b1 = params.Cf/(params.m * vx_safe)
+        b2 = params.lf*params.Cf/params.Iz
         
-        # Lateral error derivative dynamics
-        e_y_ddot = params.vx * (psi_dot + beta_dot)
+        beta_dot = a11*beta + a12*psi_dot + b1*delta
+        psi_ddot = a21*beta + a22*psi_dot + b2*delta
         
-        xdot = vertcat(beta_dot, psi_ddot, psi_dot, y_dot, e_y_ddot)
+        # Safe lateral dynamics
+        y_dot = vx_safe * (sin(psi) + beta * cos(psi))
+        
+        xdot = vertcat(beta_dot, psi_ddot, psi_dot, y_dot)
         return Function('f', [x, u], [xdot], ['x', 'u'], ['xdot'])
 
     def setup_mpc(self):
         N = self.mpc_params.N
         dt = self.mpc_params.dt
         
-        # Decision variables for states and controls
-        X = SX.sym('X', 5, N+1)  # Updated for 5 states
+        X = SX.sym('X', 4, N+1)
         U = SX.sym('U', 1, N)
+        P = SX.sym('P', 8)  # x0 + x_ref
         
-        # Parameters (current state and reference trajectory)
-        P = SX.sym('P', 5 + 5*N)  # initial state (5) + reference trajectory (5×N)
-        
-        # Define objective and constraints
         obj = 0
         g = []
+        g.append(X[:, 0] - P[0:4])
         
-        # Initial state constraint
-        g.append(X[:, 0] - P[0:5])
+        # Well-conditioned weights
+        Q = np.diag([2.0, 0.5, 5.0, 10.0])  # Reduced weights for stability
+        R = np.diag([5.0])                  # Higher control penalty
+        Q_terminal = np.diag([5.0, 1.0, 10.0, 20.0])
         
-        # Weights for state error
-        Q = diag(SX([10.0, 5.0, 20.0, 50.0, 10.0]))  # Added weight for lateral error derivative
+        x_ref = P[4:8]
         
-        # Weights for control input and steering rate
-        R_steer = 5.0
-        R_steer_rate = 50.0
-        
-        # Define the objective function with reference trajectory
         for k in range(N):
-            # Current state and control
-            x_k = X[:, k]
-            u_k = U[:, k]
+            x = X[:, k]
+            u = U[:, k]
             
-            # Reference values for this step (extracted from parameter vector)
-            x_ref_k = P[5+5*k:5+5*(k+1)]
+            # State cost with input protection
+            state_diff = x - x_ref
+            state_diff[0] = if_else(fabs(x[0]) > 0.5, 0, state_diff[0])  # Limit beta influence
+            state_diff[3] = if_else(fabs(x[3]) > 10.0, 0, state_diff[3]) # Limit y influence
             
-            # State tracking error cost
-            state_cost = mtimes([(x_k - x_ref_k).T, Q, (x_k - x_ref_k)])
+            obj += mtimes([state_diff.T, Q, state_diff]) + mtimes([u.T, R, u])
             
-            # Control input cost
-            control_cost = R_steer * u_k**2
-            
-            # Steering rate cost (if not the first step)
-            rate_cost = 0
+            # Strong steering rate penalty
             if k > 0:
-                rate_cost = R_steer_rate * (u_k - U[:, k-1])**2
-            
-            # Add costs to objective
-            obj += state_cost + control_cost + rate_cost
-            
-            # System dynamics constraint
+                obj += 10.0 * (U[:, k] - U[:, k-1])**2
+                
+            # Dynamics constraint with protection
             x_next = X[:, k+1]
-            xdot = self.model(x_k, u_k)
-            x_next_pred = x_k + xdot * dt
+            xdot = self.model(x, u)
+            x_next_pred = x + xdot * dt
             g.append(x_next - x_next_pred)
+            
+        obj += mtimes([(X[:, N] - x_ref).T, Q_terminal, (X[:, N] - x_ref)])
         
-        # Terminal cost
-        x_ref_N = P[5+5*(N-1):5+5*N]  # Last reference point
-        obj += 100 * mtimes([(X[:, N] - x_ref_N).T, Q, (X[:, N] - x_ref_N)])
+        nlp = {'x': vertcat(reshape(X, -1, 1), reshape(U, -1, 1)),
+               'f': obj,
+               'g': vertcat(*g),
+               'p': P}
         
-        # Define optimization variables
-        opt_vars = vertcat(reshape(X, -1, 1), reshape(U, -1, 1))
-        
-        # Define NLP problem
-        nlp = {'x': opt_vars, 'f': obj, 'g': vertcat(*g), 'p': P}
-        
-        # Solver options
         opts = {
             'ipopt.print_level': 0,
             'ipopt.sb': 'yes',
             'print_time': 0,
             'ipopt.max_iter': self.mpc_params.max_iter,
-            'ipopt.tol': 1e-4,
-            'ipopt.acceptable_tol': 1e-3
+            'ipopt.tol': 1e-3  # Looser tolerance for stability
         }
         
-        # Create solver
         self.solver = nlpsol('solver', 'ipopt', nlp, opts)
         
-        # Define bounds
-        self.lbx = [-np.pi/4] * 5 * (N+1)  # Lower bounds for states
-        self.lbx += [-self.mpc_params.max_steer] * N  # Lower bounds for controls
+        # Conservative bounds
+        self.lbx = [-0.5, -1.0, -np.pi, -10.0]*(N+1) + [-self.mpc_params.max_steer]*N
+        self.ubx = [0.5, 1.0, np.pi, 10.0]*(N+1) + [self.mpc_params.max_steer]*N
         
-        self.ubx = [np.pi/4] * 5 * (N+1)  # Upper bounds for states
-        self.ubx += [self.mpc_params.max_steer] * N  # Upper bounds for controls
-        
-        # Equality constraints bounds (all zeros)
-        self.lbg = [0] * (5 + 5*N)
-        self.ubg = [0] * (5 + 5*N)
+        # Constraint bounds
+        self.lbg = [-0.1, -0.1, -0.1, -0.1]*(N+1)  # Looser constraints
+        self.ubg = [0.1, 0.1, 0.1, 0.1]*(N+1)
 
-    def solve_mpc(self, x0, reference_trajectory):
-        """
-        Solve the MPC problem
-        
-        Args:
-            x0: Current state [beta, psi_dot, psi, y, e_y_dot]
-            reference_trajectory: Array of reference states for the horizon
-        """
+    def solve_mpc(self, x0, x_ref):
         N = self.mpc_params.N
         
-        # Ensure reference trajectory has enough points
-        if len(reference_trajectory) < N:
-            last_ref = reference_trajectory[-1]
-            reference_trajectory = np.vstack([reference_trajectory, 
-                                             np.tile(last_ref, (N - len(reference_trajectory), 1))])
+        # State filtering and protection
+        x0_safe = np.nan_to_num(x0, nan=0.0, posinf=0.5, neginf=-0.5)
+        x_ref_safe = np.nan_to_num(x_ref, nan=0.0, posinf=0.5, neginf=-0.5)
+        
+        # Apply low-pass filter to state
+        x0_filtered = 0.3 * self.last_state + 0.7 * x0_safe
+        self.last_state = x0_filtered
         
         # Initial guess
-        x_init = np.tile(x0, (N+1, 1)).T.flatten()
-        u_init = np.zeros(N)
-        
-        if hasattr(self, 'prev_sol'):
-            # Warm start from previous solution
-            x_init = np.concatenate([self.prev_sol[5:5*(N+1)], self.prev_sol[-5:], np.zeros(5)])
-            u_init = np.concatenate([self.prev_sol[5*(N+1)+1:], [0.0]])
-        
+        x_init = np.tile(x0_filtered, N+1)
+        u_init = np.ones(N) * self.last_steer
         vars_init = np.concatenate([x_init, u_init])
+        p = np.concatenate([x0_filtered, x_ref_safe])
         
-        # Create parameter vector
-        p = np.concatenate([x0, reference_trajectory[:N].flatten()])
-        
-        # Add steering rate constraints
-        if hasattr(self, 'prev_steer'):
-            steer_rate_limit = self.mpc_params.steer_rate_limit
+        # Solve NLP
+        try:
+            sol = self.solver(
+                x0=vars_init,
+                lbx=self.lbx,
+                ubx=self.ubx,
+                lbg=self.lbg,
+                ubg=self.ubg,
+                p=p
+            )
             
-            # Adjust bounds for first control to respect rate limit
-            self.lbx[5*(N+1)] = max(-self.mpc_params.max_steer, self.prev_steer - steer_rate_limit)
-            self.ubx[5*(N+1)] = min(self.mpc_params.max_steer, self.prev_steer + steer_rate_limit)
-        
-        # Solve optimization problem
-        sol = self.solver(
-            x0=vars_init,
-            lbx=self.lbx,
-            ubx=self.ubx,
-            lbg=self.lbg,
-            ubg=self.ubg,
-            p=p
-        )
-        
-        # Extract solution
-        self.prev_sol = sol['x'].full().flatten()
-        u_opt = self.prev_sol[5*(N+1):]
-        
-        # Store steering command for rate limiting
-        steer_command = float(u_opt[0])
-        self.prev_steer = steer_command
-        
-        return steer_command
+            vars_opt = sol['x'].full().flatten()
+            u_opt = vars_opt[4*(N+1):]
+            
+            # Strong smoothing
+            smoothed_steer = self.mpc_params.steer_smoothing * self.last_steer + \
+                            (1 - self.mpc_params.steer_smoothing) * u_opt[0]
+            self.last_steer = smoothed_steer
+            
+            return smoothed_steer
+            
+        except Exception as e:
+            print(f"MPC solve error: {e}, using last steering")
+            return self.last_steer
 
 class CarlaInterface:
-    def __init__(self, mpc_params):
+    def __init__(self, mpc_params, vehicle_params):
         self.mpc_params = mpc_params
+        self.vehicle_params = vehicle_params
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(20.0)
         
@@ -216,7 +182,7 @@ class CarlaInterface:
             self.world = self.client.get_world()
             self.map = self.world.get_map()
             
-            # Set synchronous mode with fixed time step
+            # Set synchronous mode
             settings = self.world.get_settings()
             settings.synchronous_mode = True
             settings.fixed_delta_seconds = self.mpc_params.dt
@@ -224,14 +190,13 @@ class CarlaInterface:
             
             self.blueprint_library = self.world.get_blueprint_library()
             self.spawn_vehicle_on_straight_road()
-            self.setup_sensors()
+            self.setup_visualization()
             
             self.collision_count = 0
-            self.max_collisions = 3
-            self.last_steer = 0.0
+            self.max_collisions = 2
             self.waypoints = []
+            self.last_update_time = 0
             self.should_stop = False
-            self.prev_steer_command = 0.0
             
         except Exception as e:
             print(f"Initialization failed: {e}")
@@ -239,192 +204,148 @@ class CarlaInterface:
             raise
 
     def spawn_vehicle_on_straight_road(self):
-        """Find a suitable road segment for driving"""
+        """Find a long straight highway segment"""
         spawn_points = self.map.get_spawn_points()
         
-        # Prefer highways or major roads
-        highway_spawns = [sp for sp in spawn_points 
-                         if self.map.get_waypoint(sp.location).is_junction == False and
-                         self.map.get_waypoint(sp.location).lane_type == carla.LaneType.Driving]
-        
-        if not highway_spawns:
-            highway_spawns = spawn_points
-        
-        # Find spawn point with good straight/curved path ahead
+        # Filter points on straight roads
         best_spawn = None
-        max_quality_score = 0
+        max_dist = 0
         
-        for sp in highway_spawns:
+        for sp in spawn_points:
             wp = self.map.get_waypoint(sp.location)
-            path_score = self.evaluate_path_quality(wp, distance=150.0)
-            if path_score > max_quality_score:
-                max_quality_score = path_score
+            dist = self.check_straight_path(wp, distance=100.0)
+            if dist > max_dist:
+                max_dist = dist
                 best_spawn = sp
         
         if not best_spawn:
-            best_spawn = random.choice(highway_spawns)
+            best_spawn = random.choice(spawn_points)
         
-        # Spawn vehicle
+        # Spawn with collision avoidance
         vehicle_bp = self.blueprint_library.find('vehicle.tesla.model3')
+        spawn_transform = carla.Transform(
+            best_spawn.location + carla.Location(z=0.5),
+            best_spawn.rotation
+        )
         
-        # Try to set minimum physics control for better stability
-        if vehicle_bp.has_attribute('physics_control'):
-            physics_control = vehicle_bp.get_attribute('physics_control').recommended_values
-            if physics_control:
-                vehicle_bp.set_attribute('physics_control', physics_control[0])
+        self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_transform)
+        if not self.vehicle:
+            self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_transform)
         
-        self.vehicle = self.world.spawn_actor(vehicle_bp, best_spawn)
         self.vehicle.set_autopilot(False)
+        self.generate_waypoints_ahead(100.0)
         
-        # Generate waypoints for the reference path
-        self.generate_reference_path(200.0)
-        
-        # Set up spectator camera
+        # Set spectator
         self.spectator = self.world.get_spectator()
         self.update_spectator_view()
 
-    def evaluate_path_quality(self, waypoint, distance=100.0):
-        """
-        Evaluate the quality of a potential path.
-        Returns a score combining straightness and curvature.
-        """
+    def check_straight_path(self, waypoint, distance=100.0):
+        """Check path straightness ahead"""
         current = waypoint
         total_distance = 0
-        curvature_changes = 0
-        last_heading = current.transform.rotation.yaw
-        
         while total_distance < distance:
-            next_wps = current.next(5.0)
+            next_wps = current.next(10.0)
             if not next_wps:
                 break
-            
-            current = next_wps[0]
-            current_heading = current.transform.rotation.yaw
-            
-            # Detect significant heading changes (curvature)
-            if abs((current_heading - last_heading + 180) % 360 - 180) > 5:
-                curvature_changes += 1
                 
-            last_heading = current_heading
-            total_distance += 5.0
-        
-        # Score that prefers some curves (not too many, not too few)
-        straightness_score = total_distance / distance
-        curve_score = min(5, curvature_changes) / 5.0  # Optimal is having some curves
-        
-        # Combined score (0-1)
-        return 0.7 * straightness_score + 0.3 * curve_score
+            angle_diff = abs(current.transform.rotation.yaw - next_wps[0].transform.rotation.yaw)
+            if angle_diff > 2.0:  # Very strict straightness check
+                break
+                
+            current = next_wps[0]
+            total_distance += 10.0
+            
+            if not self.is_location_clear(current.transform.location):
+                break
+                
+        return total_distance
 
-    def generate_reference_path(self, distance):
-        """Create a more detailed reference path with more waypoints"""
+    def is_location_clear(self, location, radius=5.0):
+        """Check for nearby static objects"""
+        for actor in self.world.get_actors():
+            if 'static' in actor.type_id and location.distance(actor.get_location()) < radius:
+                return False
+        return True
+
+    def generate_waypoints_ahead(self, distance):
+        """Generate smooth reference path"""
         current_loc = self.vehicle.get_location()
         current_wp = self.map.get_waypoint(current_loc)
         
         self.waypoints = []
         wp = current_wp
         dist = 0
-        step_size = 2.0  # Smaller steps for more detailed path
         
         while dist < distance:
             self.waypoints.append(wp)
-            next_wps = wp.next(step_size)
+            next_wps = wp.next(5.0)
             if not next_wps:
                 break
             wp = next_wps[0]
-            dist += step_size
-        
-        print(f"Generated {len(self.waypoints)} waypoints covering {dist:.1f} meters")
+            dist += 5.0
 
-    def get_reference_trajectory(self, look_ahead_points=15):
-        """
-        Create reference trajectory for MPC horizon
-        Returns array of reference states [β, ψ_dot, ψ, y, e_y_dot]
-        """
-        if not self.waypoints:
-            # Default reference if no waypoints available
-            return np.tile(np.array([0.0, 0.0, 0.0, 0.0, 0.0]), (look_ahead_points, 1))
-        
-        # Get vehicle state
+    def update_waypoints(self):
+        """Maintain sufficient lookahead"""
+        if time.time() - self.last_update_time < 0.5:  # Update every 0.5s
+            return
+            
+        self.last_update_time = time.time()
         vehicle_loc = self.vehicle.get_location()
-        vehicle_rot = self.vehicle.get_transform().rotation
-        vehicle_yaw = math.radians(vehicle_rot.yaw)
         
-        # Find closest waypoint index
-        closest_idx = min(range(len(self.waypoints)), 
-                          key=lambda i: self.waypoints[i].transform.location.distance(vehicle_loc))
+        # Remove passed waypoints
+        self.waypoints = [wp for wp in self.waypoints 
+                         if wp.transform.location.distance(vehicle_loc) > 5.0]
         
-        # Create reference trajectory
-        reference = []
-        
-        # If we're near the end of the path, regenerate
-        if closest_idx + look_ahead_points >= len(self.waypoints) - 5:
-            self.generate_reference_path(200.0)
-            return self.get_reference_trajectory(look_ahead_points)
-        
-        v_lon = self.vehicle_params.vx
-        ref_points = min(look_ahead_points, len(self.waypoints) - closest_idx)
-        
-        for i in range(ref_points):
-            idx = closest_idx + i
-            if idx >= len(self.waypoints):
-                break
-                
-            wp = self.waypoints[idx]
-            
-            # Calculate desired yaw
-            if idx < len(self.waypoints) - 1:
-                next_wp = self.waypoints[idx + 1]
-                dx = next_wp.transform.location.x - wp.transform.location.x
-                dy = next_wp.transform.location.y - wp.transform.location.y
-                desired_yaw = np.arctan2(dy, dx)
-            else:
-                desired_yaw = math.radians(wp.transform.rotation.yaw)
-            
-            # Desired lateral position (simplified to waypoint y coordinate)
-            desired_y = wp.transform.location.y
-            
-            # Calculate desired yaw rate from path curvature
-            if i < ref_points - 1:
-                next_yaw = math.radians(self.waypoints[idx + 1].transform.rotation.yaw)
-                yaw_diff = (next_yaw - desired_yaw + np.pi) % (2 * np.pi) - np.pi
-                desired_yaw_rate = yaw_diff / (self.mpc_params.dt * v_lon)
-            else:
-                desired_yaw_rate = 0.0
-            
-            # Calculate desired lateral speed
-            if i < ref_points - 1:
-                next_y = self.waypoints[idx + 1].transform.location.y
-                desired_y_dot = (next_y - desired_y) / self.mpc_params.dt
-            else:
-                desired_y_dot = 0.0
-            
-            # Desired sideslip is assumed to be 0 for most cases
-            desired_beta = 0.0
-            
-            reference.append([desired_beta, desired_yaw_rate, desired_yaw, desired_y, desired_y_dot])
-        
-        # Fill remaining slots with the last reference point if needed
-        if len(reference) < look_ahead_points:
-            last_ref = reference[-1]
-            reference.extend([last_ref] * (look_ahead_points - len(reference)))
-        
-        return np.array(reference)
+        # Extend path if needed
+        if len(self.waypoints) < 15:
+            last_wp = self.waypoints[-1] if self.waypoints else self.map.get_waypoint(vehicle_loc)
+            new_wps = last_wp.next(50.0)
+            if new_wps:
+                self.waypoints.extend(new_wps[:10])
 
-    def setup_sensors(self):
-        """Set up sensors for monitoring and visualization"""
-        # RGB camera
-        camera_bp = self.blueprint_library.find('sensor.camera.rgb')
-        camera_bp.set_attribute('image_size_x', '640')
-        camera_bp.set_attribute('image_size_y', '480')
-        camera_bp.set_attribute('fov', '90')
+    def get_reference_state(self):
+        """Get safe reference state"""
+        if not self.waypoints:
+            return np.array([0.0, 0.0, 0.0, 0.0])
         
-        camera_transform = carla.Transform(carla.Location(x=-8, z=6), carla.Rotation(pitch=-20))
-        self.camera = self.world.spawn_actor(
-            camera_bp,
-            camera_transform,
-            attach_to=self.vehicle
+        # Find lookahead point (adaptive based on speed)
+        speed = self.vehicle.get_velocity().length()
+        lookahead_dist = min(10.0, max(3.0, speed * 0.8))
+        lookahead_idx = min(int(lookahead_dist / 5.0), len(self.waypoints)-1)
+        target_wp = self.waypoints[lookahead_idx]
+        
+        desired_yaw = math.radians(target_wp.transform.rotation.yaw)
+        desired_y = target_wp.transform.location.y
+        
+        return np.array([0.0, 0.0, desired_yaw, desired_y])
+
+    def update_spectator_view(self):
+        """Smooth following camera"""
+        if not hasattr(self, 'vehicle') or not self.vehicle:
+            return
+            
+        transform = self.vehicle.get_transform()
+        speed = self.vehicle.get_velocity().length()
+        
+        # Camera parameters
+        distance = 8.0 + speed * 0.3
+        height = 3.0 + speed * 0.1
+        pitch = -15 - speed * 0.5
+        
+        camera_pos = transform.location + carla.Location(
+            x=-distance,
+            z=height
         )
         
+        rotation = carla.Rotation(
+            pitch=pitch,
+            yaw=transform.rotation.yaw
+        )
+        
+        self.spectator.set_transform(carla.Transform(camera_pos, rotation))
+
+    def setup_visualization(self):
+        """Setup sensors and debug tools"""
         # Collision sensor
         collision_bp = self.blueprint_library.find('sensor.other.collision')
         self.collision_sensor = self.world.spawn_actor(
@@ -433,321 +354,201 @@ class CarlaInterface:
             attach_to=self.vehicle
         )
         self.collision_sensor.listen(self.handle_collision)
-
-    def update_spectator_view(self):
-        """Update the spectator camera for better visualization"""
-        if not hasattr(self, 'vehicle') or not self.vehicle:
-            return
-            
-        transform = self.vehicle.get_transform()
-        vehicle_location = transform.location
         
-        # Calculate camera location for better visibility
-        camera_distance = 10
-        camera_height = 5
-        yaw_rad = math.radians(transform.rotation.yaw)
-        
-        camera_x = vehicle_location.x - camera_distance * math.cos(yaw_rad)
-        camera_y = vehicle_location.y - camera_distance * math.sin(yaw_rad)
-        
-        camera_location = carla.Location(x=camera_x, y=camera_y, z=vehicle_location.z + camera_height)
-        camera_rotation = carla.Rotation(pitch=-20, yaw=transform.rotation.yaw)
-        
-        self.spectator.set_transform(carla.Transform(camera_location, camera_rotation))
+        # Debug drawing
+        self.debug = self.world.debug
 
     def get_vehicle_state(self):
-        """Get enhanced vehicle state: [β, ψ_dot, ψ, y, e_y_dot]"""
-        transform = self.vehicle.get_transform()
-        velocity = self.vehicle.get_velocity()
-        angular_velocity = self.vehicle.get_angular_velocity()
-        
-        # Calculate longitudinal and lateral velocities
-        vel_magnitude = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
-        yaw = math.radians(transform.rotation.yaw)
-        
-        # Convert velocities to vehicle frame
-        vx = velocity.x * math.cos(yaw) + velocity.y * math.sin(yaw)
-        vy = -velocity.x * math.sin(yaw) + velocity.y * math.cos(yaw)
-        
-        # Calculate sideslip angle
-        beta = math.atan2(vy, vx) if abs(vx) > 0.1 else 0.0
-        
-        # Yaw rate (angular velocity around z-axis)
-        psi_dot = angular_velocity.z
-        
-        # Vehicle position and orientation
-        psi = yaw
-        y = transform.location.y
-        
-        # Lateral error derivative (approximately lateral velocity)
-        e_y_dot = vy
-        
-        return np.array([beta, psi_dot, psi, y, e_y_dot])
+        """Robust state estimation"""
+        try:
+            transform = self.vehicle.get_transform()
+            velocity = self.vehicle.get_velocity()
+            angular_velocity = self.vehicle.get_angular_velocity()
+            
+            vx = math.sqrt(velocity.x**2 + velocity.y**2)
+            vy = velocity.y
+            
+            # Filter noisy measurements
+            if vx < 0.1:
+                beta = 0.0
+            else:
+                beta = math.atan2(vy, vx)
+                beta = np.clip(beta, -0.5, 0.5)  # Limit sideslip
+            
+            psi_dot = angular_velocity.z
+            psi_dot = np.clip(psi_dot, -1.0, 1.0)  # Limit yaw rate
+            
+            psi = math.radians(transform.rotation.yaw % 360)
+            y = transform.location.y
+            y = np.clip(y, -10.0, 10.0)  # Limit lateral deviation
+            
+            return np.array([beta, psi_dot, psi, y])
+            
+        except Exception as e:
+            print(f"State estimation error: {e}")
+            return np.array([0.0, 0.0, 0.0, 0.0])
 
     def handle_collision(self, event):
-        """Improved collision recovery with diagnostics"""
-        if not self.vehicle or not self.vehicle.is_alive:
-            return
-            
+        """Collision recovery system"""
         self.collision_count += 1
-        collision_type = event.other_actor.type_id
-        
-        print(f"Collision #{self.collision_count} detected with {collision_type}")
-        
-        # Get vehicle state for diagnostics
-        state = self.get_vehicle_state()
-        print(f"Vehicle state at collision: sideslip={math.degrees(state[0]):.1f}°, "
-              f"yaw_rate={math.degrees(state[1]):.1f}°/s, lateral_pos={state[3]:.2f}m")
+        print(f"Collision #{self.collision_count} with {event.other_actor.type_id}")
         
         if self.collision_count >= self.max_collisions:
             print("Max collisions reached, stopping simulation")
             self.should_stop = True
             return
             
-        # Reset to safe position
-        current_transform = self.vehicle.get_transform()
-        
-        # Try to find nearby safe position
-        current_waypoint = self.map.get_waypoint(current_transform.location)
-        
-        # Move vehicle to the center of the lane, slightly ahead
-        safe_location = current_waypoint.transform.location
-        safe_location.z += 0.5  # Lift slightly to avoid ground collisions
-        
-        # Use waypoint orientation for safer reset
-        safe_rotation = current_waypoint.transform.rotation
-        
-        reset_transform = carla.Transform(safe_location, safe_rotation)
+        # Find safe recovery location
+        current_loc = self.vehicle.get_location()
+        recovery_loc = self.find_recovery_location(current_loc)
         
         # Reset vehicle
-        self.vehicle.set_transform(reset_transform)
+        self.vehicle.set_transform(carla.Transform(
+            recovery_loc,
+            self.vehicle.get_transform().rotation
+        ))
         
-        # Stop the vehicle
+        # Full stop
         control = carla.VehicleControl()
         control.throttle = 0.0
         control.brake = 1.0
         control.steer = 0.0
         self.vehicle.apply_control(control)
         
-        # Regenerate waypoints
-        self.generate_reference_path(200.0)
-        time.sleep(0.5)  # Give time for physics to settle
+        # Regenerate path
+        self.generate_waypoints_ahead(100.0)
+        time.sleep(1.0)  # Recovery pause
 
-    def apply_control(self, steer_command, vehicle_params):
-        """Apply control with smooth acceleration and proper steering"""
-        # Smooth steering transitions
-        max_steer_change = self.mpc_params.steer_rate_limit
-        steer_diff = steer_command - self.last_steer
+    def find_recovery_location(self, location):
+        """Find nearest safe location"""
+        waypoints = self.map.generate_waypoints(5.0)
+        nearest = sorted(waypoints, key=lambda wp: wp.transform.location.distance(location))
         
-        if abs(steer_diff) > max_steer_change:
-            steer_command = self.last_steer + np.sign(steer_diff) * max_steer_change
+        for wp in nearest[:20]:
+            if self.is_location_clear(wp.transform.location, radius=10.0):
+                return wp.transform.location + carla.Location(z=0.5)
+        
+        # Fallback - lift vehicle
+        return location + carla.Location(z=1.0)
+
+    def apply_control(self, steer):
+        """Safe control application"""
+        if not hasattr(self, 'vehicle') or not self.vehicle:
+            return
             
-        self.last_steer = steer_command
+        # Clip and filter steering
+        steer = np.clip(steer, -self.mpc_params.max_steer, self.mpc_params.max_steer)
         
-        # Create control command
+        # Adaptive throttle based on speed error
+        current_speed = self.vehicle.get_velocity().length()
+        target_speed = self.vehicle_params.vx
+        speed_error = target_speed - current_speed
+        
+        throttle = 0.15 + 0.005 * speed_error
+        throttle = np.clip(throttle, 0.1, 0.2)  # Conservative throttle
+        
         control = carla.VehicleControl()
-        
-        # Apply steering - convert to Carla's [-1, 1] range
-        normalized_steer = steer_command / self.mpc_params.max_steer
-        control.steer = np.clip(normalized_steer, -1.0, 1.0)
-        
-        # Apply throttle based on desired speed
-        current_speed = math.sqrt(
-            self.vehicle.get_velocity().x**2 + 
-            self.vehicle.get_velocity().y**2
-        )
-        
-        if current_speed < vehicle_params.vx - 0.5:
-            control.throttle = min(0.6, (vehicle_params.vx - current_speed) * 0.1)
-            control.brake = 0.0
-        elif current_speed > vehicle_params.vx + 0.5:
-            control.throttle = 0.0
-            control.brake = min(0.3, (current_speed - vehicle_params.vx) * 0.1)
-        else:
-            control.throttle = 0.2
-            control.brake = 0.0
+        control.steer = float(steer)
+        control.throttle = float(throttle)
+        control.brake = 0.0
         
         self.vehicle.apply_control(control)
 
-    def debug_draw_waypoints(self):
-        """Visualize the reference path with better color coding"""
-        if not self.waypoints:
-            return
-            
-        debug = self.world.debug
-        vehicle_loc = self.vehicle.get_location()
-        
-        # Find closest waypoint for color coding
-        closest_idx = min(range(len(self.waypoints)), 
-                         key=lambda i: self.waypoints[i].transform.location.distance(vehicle_loc))
-        
-        # Draw waypoints with different colors
-        for i in range(len(self.waypoints)-1):
-            color = carla.Color(0, 255, 0)  # Default: green
-            
-            # Closest waypoints in red
-            if i >= closest_idx and i < closest_idx + 5:
-                color = carla.Color(255, 0, 0)
-            # Near future waypoints in yellow
-            elif i >= closest_idx + 5 and i < closest_idx + 15:
-                color = carla.Color(255, 255, 0)
-            
-            debug.draw_line(
-                self.waypoints[i].transform.location + carla.Location(z=0.5),
-                self.waypoints[i+1].transform.location + carla.Location(z=0.5),
-                thickness=0.1,
-                color=color,
-                life_time=0.1
-            )
-            
-            # Draw points at each waypoint
-            if i % 3 == 0:  # Only draw every 3rd waypoint for clarity
-                debug.draw_point(
-                    self.waypoints[i].transform.location + carla.Location(z=0.5),
-                    size=0.1,
-                    color=color,
-                    life_time=0.1
-                )
-
-    def debug_draw_vehicle_state(self, state):
-        """Draw velocity and trajectory prediction vectors"""
-        if not self.vehicle:
-            return
-            
-        debug = self.world.debug
-        transform = self.vehicle.get_transform()
-        location = transform.location
-        
-        # Draw velocity vector
-        velocity = self.vehicle.get_velocity()
-        vel_magnitude = math.sqrt(velocity.x**2 + velocity.y**2)
-        
-        if vel_magnitude > 0.1:
-            vel_dir = carla.Location(
-                x=velocity.x/vel_magnitude,
-                y=velocity.y/vel_magnitude,
-                z=0
-            )
-            
-            debug.draw_arrow(
-                location + carla.Location(z=0.5),
-                location + carla.Location(z=0.5) + vel_dir * 5,
-                thickness=0.1,
-                arrow_size=0.2,
-                color=carla.Color(0, 0, 255),
-                life_time=0.1
-            )
-        
-        # Draw heading vector
-        yaw_rad = math.radians(transform.rotation.yaw)
-        heading_dir = carla.Location(
-            x=math.cos(yaw_rad),
-            y=math.sin(yaw_rad),
-            z=0
-        )
-        
-        debug.draw_arrow(
-            location + carla.Location(z=1.0),
-            location + carla.Location(z=1.0) + heading_dir * 3,
-            thickness=0.1,
-            arrow_size=0.2,
-            color=carla.Color(255, 165, 0),  # Orange
-            life_time=0.1
-        )
-
-    def run_simulation(self, controller, vehicle_params, duration=30.0):
-        """Run the simulation with enhanced monitoring and debugging"""
+    def run_simulation(self, controller, duration=60.0):
         self.should_stop = False
         start_time = time.time()
-        self.vehicle_params = vehicle_params  # Store for reference
-        
-        # Performance metrics
-        total_lateral_error = 0
-        total_steps = 0
-        max_lateral_error = 0
         
         try:
             while (time.time() - start_time) < duration and not self.should_stop:
-                # Tick the CARLA world
                 self.world.tick()
                 
-                # Get vehicle state
-                current_state = self.get_vehicle_state()
+                # Update path
+                self.update_waypoints()
                 
-                # Get reference trajectory for the MPC horizon
-                reference_trajectory = self.get_reference_trajectory(controller.mpc_params.N)
+                # Get states
+                x0 = self.get_vehicle_state()
+                x_ref = self.get_reference_state()
                 
-                # Solve MPC
-                try:
-                    steer_command = controller.solve_mpc(current_state, reference_trajectory)
-                    self.apply_control(steer_command, vehicle_params)
-                except Exception as e:
-                    print(f"MPC solver error: {e}")
-                    # Use previous steering as fallback
-                    self.apply_control(self.last_steer, vehicle_params)
+                # MPC control
+                steer = controller.solve_mpc(x0, x_ref)
+                self.apply_control(steer)
                 
-                # Update visualization
+                # Visualization
                 self.update_spectator_view()
-                self.debug_draw_waypoints()
-                self.debug_draw_vehicle_state(current_state)
+                self.draw_debug_info()
                 
-                # Calculate metrics
-                if len(self.waypoints) > 0:
-                    vehicle_loc = self.vehicle.get_location()
-                    closest_idx = min(range(len(self.waypoints)), 
-                                    key=lambda i: self.waypoints[i].transform.location.distance(vehicle_loc))
-                    
-                    if closest_idx < len(self.waypoints):
-                        lateral_error = abs(self.waypoints[closest_idx].transform.location.y - vehicle_loc.y)
-                        total_lateral_error += lateral_error
-                        max_lateral_error = max(max_lateral_error, lateral_error)
-                        total_steps += 1
-
-            # Print performance metrics
-            if total_steps > 0:
-                avg_lateral_error = total_lateral_error / total_steps
-                print(f"Average lateral error: {avg_lateral_error:.2f} m")
-                print(f"Maximum lateral error: {max_lateral_error:.2f} m")
+                time.sleep(0.01)
+                
         except Exception as e:
             print(f"Simulation error: {e}")
         finally:
             self.cleanup()
-            print("Cleaning up CARLA actors...")
-            print("Simulation ended.")
+
+    def draw_debug_info(self):
+        """Visualize important information"""
+        if not hasattr(self, 'vehicle') or not hasattr(self, 'waypoints'):
+            return
+            
+        # Draw path
+        for i in range(len(self.waypoints)-1):
+            self.debug.draw_line(
+                self.waypoints[i].transform.location + carla.Location(z=0.5),
+                self.waypoints[i+1].transform.location + carla.Location(z=0.5),
+                thickness=0.1,
+                color=carla.Color(0, 255, 0),
+                life_time=0.2
+            )
+        
+        # Vehicle info
+        transform = self.vehicle.get_transform()
+        velocity = self.vehicle.get_velocity()
+        speed = 3.6 * velocity.length()  # km/h
+        
+        self.debug.draw_string(
+            transform.location + carla.Location(z=5),
+            f"Speed: {speed:.1f} km/h\nSteering: {math.degrees(self.vehicle.get_control().steer):.1f}°\nCollisions: {self.collision_count}",
+            False,
+            color=carla.Color(255, 255, 255),
+            life_time=0.1
+        )
 
     def cleanup(self):
-        """Clean up CARLA actors and settings"""
-        if hasattr(self, 'vehicle') and self.vehicle.is_alive:
-            self.vehicle.destroy()
-        if hasattr(self, 'camera') and self.camera.is_alive:
-            self.camera.destroy()
-        if hasattr(self, 'collision_sensor') and self.collision_sensor.is_alive:
-            self.collision_sensor.destroy()
+        """Proper cleanup"""
+        actors = ['vehicle', 'collision_sensor']
+        for name in actors:
+            if hasattr(self, name):
+                actor = getattr(self, name)
+                if actor and actor.is_alive:
+                    actor.destroy()
+        
+        # Reset synchronous mode
         if hasattr(self, 'world'):
             settings = self.world.get_settings()
             settings.synchronous_mode = False
             self.world.apply_settings(settings)
 
-if __name__ == "__main__":
-    # Initialize vehicle and MPC parameters
-    vehicle_params = VehicleParams()
-    mpc_params = MPCParams()
-    
-    # Create Carla interface and MPC controller
-    carla_interface = CarlaInterface(mpc_params)
-    mpc_controller = MPCController(vehicle_params, mpc_params)
-    
-    # Run the simulation
+def main():
     try:
-        carla_interface.run_simulation(mpc_controller, vehicle_params, duration=60.0)
+        vehicle_params = VehicleParams()
+        mpc_params = MPCParams()
+        
+        controller = MPCController(vehicle_params, mpc_params)
+        carla_interface = CarlaInterface(mpc_params, vehicle_params)
+        
+        print("Starting robust MPC simulation...")
+        print("Vehicle parameters:", vars(vehicle_params))
+        print("MPC parameters:", vars(mpc_params))
+        
+        carla_interface.run_simulation(controller, duration=60.0)
+        
     except KeyboardInterrupt:
-        print("Simulation interrupted by user.")
-        carla_interface.cleanup()
+        print("Simulation stopped by user")
     except Exception as e:
-        print(f"Unexpected error: {e}")
-        carla_interface.cleanup()
+        print(f"Main error: {e}")
     finally:
-        print("Final cleanup...")
-        carla_interface.cleanup()
-        print("All actors cleaned up.")
-        print("Simulation finished.")
+        if 'carla_interface' in locals():
+            carla_interface.cleanup()
+        print("Simulation ended")
+
+if __name__ == '__main__':
+    main()
