@@ -1,7 +1,7 @@
 import carla
 import numpy as np
 import casadi as ca
-import matplotlib.pyplot as plt
+import random
 from typing import Tuple, Optional, List
 from collections import deque
 
@@ -74,15 +74,15 @@ class BicycleMPC:
         
         return state_cost + control_cost + jerk_penalty
 
-    def setup_carla_simulation(self):
+    def setup_carla_simulation(self, town: str = 'Town04'):
         """Connect to CARLA and set up the simulation environment."""
         try:
             # Connect to CARLA server
             self.client = carla.Client('localhost', 2000)
             self.client.set_timeout(10.0)
             
-            # Load Town04
-            self.world = self.client.load_world('Town04')
+            # Load the specified town
+            self.world = self.client.load_world(town)
             
             # Set up debug helper
             self.debug_helper = self.world.debug
@@ -93,18 +93,18 @@ class BicycleMPC:
             settings.fixed_delta_seconds = self.dt
             self.world.apply_settings(settings)
             
-            # Spawn a vehicle
+            # Spawn a vehicle at any available spawn point
             blueprint_library = self.world.get_blueprint_library()
-            vehicle_bp = blueprint_library.filter('model3')[0]
+            vehicle_bp = random.choice(blueprint_library.filter('vehicle.*'))
             
-            # Get spawn point near the highway in Town04
+            # Get all spawn points and select one at random
             spawn_points = self.world.get_map().get_spawn_points()
-            highway_spawn_points = [p for p in spawn_points if 100 < p.location.x < 300 and -10 < p.location.y < 10]
-            
-            if not highway_spawn_points:
-                raise RuntimeError("No suitable spawn points found in Town04 highway area")
+            if not spawn_points:
+                raise RuntimeError("No spawn points available in the map")
                 
-            spawn_point = highway_spawn_points[0]
+            spawn_point = random.choice(spawn_points)
+            print(f"Spawning vehicle at: {spawn_point.location}")
+            
             self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
             
             # Set spectator view
@@ -114,7 +114,7 @@ class BicycleMPC:
                 carla.Rotation(pitch=-90))
             self.spectator.set_transform(transform)
             
-            # Generate reference trajectory (mid-lane waypoints)
+            # Generate reference trajectory (straight line from spawn point)
             self.generate_reference_waypoints()
             
             print("CARLA simulation setup complete")
@@ -124,19 +124,36 @@ class BicycleMPC:
             raise
 
     def generate_reference_waypoints(self, distance: float = 5.0, num_points: int = 100):
-        """Generate reference waypoints along the mid-lane of the road."""
+        """Generate reference waypoints in a straight line from the vehicle's starting position."""
         map = self.world.get_map()
-        current_waypoint = map.get_waypoint(self.vehicle.get_location())
+        current_location = self.vehicle.get_location()
+        current_waypoint = map.get_waypoint(current_location)
         
         self.reference_waypoints = []
-        for _ in range(num_points):
-            # Get next waypoint in straight line
-            current_waypoint = current_waypoint.next(distance)[0]
-            self.reference_waypoints.append(current_waypoint)
+        
+        # Get vehicle's forward vector
+        transform = self.vehicle.get_transform()
+        forward_vector = transform.get_forward_vector()
+        
+        for i in range(num_points):
+            # Calculate next point in a straight line
+            next_location = carla.Location(
+                x=current_location.x + forward_vector.x * distance * i,
+                y=current_location.y + forward_vector.y * distance * i,
+                z=current_location.z)
+            
+            # Get the nearest waypoint on the road
+            waypoint = map.get_waypoint(next_location)
+            if waypoint is None:
+                # If no road waypoint found, just use the straight line point
+                waypoint = current_waypoint
+                waypoint.transform.location = next_location
+            
+            self.reference_waypoints.append(waypoint)
             
             # Visualize waypoints
             self.world.debug.draw_string(
-                current_waypoint.transform.location, 
+                waypoint.transform.location, 
                 '•', 
                 color=carla.Color(255, 0, 0), 
                 life_time=100.0)
@@ -311,8 +328,8 @@ def main():
             horizon_length=10, 
             time_step=0.1)
         
-        # Set up CARLA simulation
-        mpc.setup_carla_simulation()
+        # Set up CARLA simulation (will work with any town)
+        mpc.setup_carla_simulation(town='Town04')  # Can change to 'Town01', 'Town02', etc.
         
         # Run MPC control
         mpc.run_mpc_control()
