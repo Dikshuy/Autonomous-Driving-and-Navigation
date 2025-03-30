@@ -151,27 +151,32 @@ class MPCController:
         self.ubx = ubx
         
     def solve(self, x0, x_ref):
+        # Print initial state info for debugging
+        print(f"MPC solve input - x0: {x0}, x_ref: {x_ref}")
+        
+        # IMPORTANT: Convert x0 and x_ref to CasADi DM type to avoid numerical issues
+        x0_ca = ca.DM(x0)
+        x_ref_ca = ca.DM(x_ref)
+        
         # Initialize with zeros or previous solution for warm start
         if self.prev_u is not None and self.prev_x is not None:
             # Shift previous solution for warm start
             u0 = ca.DM.zeros((self.n_controls, self.N))
             X0 = ca.DM.zeros((self.n_states, self.N+1))
             
-            # IMPORTANT: Always set the first state to the current state
-            X0[:, 0] = x0  # This is the critical fix
+            # CRITICAL: Always set the first state to the current state
+            X0[:, 0] = x0_ca
             
-            # Shift states starting from index 1
+            # Careful shifting of states and controls
             X0[:, 1:self.N] = self.prev_x[:, 2:self.N+1]
             X0[:, self.N] = self.prev_x[:, self.N]
             
-            # Shift controls and keep last control
             u0[:, 0:self.N-1] = self.prev_u[:, 1:self.N]
             u0[:, self.N-1] = self.prev_u[:, self.N-1]
         else:
             u0 = ca.DM.zeros((self.n_controls, self.N))
             X0 = ca.DM.zeros((self.n_states, self.N+1))
-            
-            X0[:, 0] = x0
+            X0[:, 0] = x0_ca
             
             # Forward simulate with simple model to get better initial guess
             curr_state = x0.copy()
@@ -188,9 +193,11 @@ class MPCController:
         # Debug prints
         print(f"MPC initial state: x={x0[0]:.2f}, y={x0[1]:.2f}, psi={x0[2]:.2f}, v={x0[3]:.2f}")
         print(f"Target state: x={x_ref[0]:.2f}, y={x_ref[1]:.2f}, psi={x_ref[2]:.2f}, v={x_ref[3]:.2f}")
+        print(f"Initial guess first point: x={float(X0[0,0]):.2f}, y={float(X0[1,0]):.2f}")
+        print(f"Initial guess last point: x={float(X0[0,self.N]):.2f}, y={float(X0[1,self.N]):.2f}")
         
         # Set parameters
-        p = ca.vertcat(x0, x_ref)
+        p = ca.vertcat(x0_ca, x_ref_ca)
         
         # Set initial values for the NLP solver
         init_var = ca.vertcat(
@@ -213,45 +220,44 @@ class MPCController:
             pred_states = opt_var[:self.n_states*(self.N+1)].reshape((self.n_states, self.N+1))
             u_opt = opt_var[self.n_states*(self.N+1):].reshape((self.n_controls, self.N))
             
-            # Store solution for next warm start
-            self.prev_x = pred_states
-            self.prev_u = u_opt
+            # Store solution for next warm start (make deep copies)
+            self.prev_x = pred_states.copy()
+            self.prev_u = u_opt.copy()
             
-            # In the solve method after extracting the solution:
-            # Validate solution - check if first point is close to vehicle
+            # Check if MPC solution's first state matches vehicle state
             first_x = float(pred_states[0, 0])
             first_y = float(pred_states[1, 0])
             vehicle_pos = np.array([x0[0], x0[1]])
             traj_start = np.array([first_x, first_y])
             distance = np.linalg.norm(traj_start - vehicle_pos)
-
+            
             # Debug info for trajectory starting point
             print(f"Trajectory start: ({first_x:.2f}, {first_y:.2f}), Vehicle: ({x0[0]:.2f}, {x0[1]:.2f}), Distance: {distance:.2f}m")
-
-            # Relax this condition or implement a more robust handling
-            if distance > 2.0:  # Changed from 5.0 to 2.0
-                print(f"Warning: Trajectory first point far from vehicle ({distance:.2f}m), attempting to fix")
-                # Instead of rejecting, we force the first point to match the current state
-                pred_states[:, 0] = x0
-                # And recalculate the trajectory points
-                self.predicted_trajectory = []
-                for i in range(self.N+1):
-                    x_pos = float(pred_states[0, i])
-                    y_pos = float(pred_states[1, i])
-                    
-                    if not (math.isnan(x_pos) or math.isnan(y_pos) or 
-                            math.isinf(x_pos) or math.isinf(y_pos)):
-                        self.predicted_trajectory.append((x_pos, y_pos))
+            
+            # Force the first point to be the current vehicle position
+            pred_states[0, 0] = x0[0]
+            pred_states[1, 0] = x0[1]
+            
+            # Generate trajectory points from the solution
+            self.predicted_trajectory = []
+            for i in range(self.N+1):
+                x_pos = float(pred_states[0, i])
+                y_pos = float(pred_states[1, i])
                 
-                self.trajectory_valid = len(self.predicted_trajectory) > 1
-                
-                if self.trajectory_valid:
-                    print(f"Fixed trajectory with {len(self.predicted_trajectory)} points")
-                    return u_opt[:, 0]
-                else:
-                    print("Unable to fix trajectory, using fallback control")
-                    return np.array([0.0, 0.0])
-                
+                if not (math.isnan(x_pos) or math.isnan(y_pos) or 
+                        math.isinf(x_pos) or math.isinf(y_pos)):
+                    self.predicted_trajectory.append((x_pos, y_pos))
+            
+            self.trajectory_valid = len(self.predicted_trajectory) > 1
+            
+            # Final debug check on the trajectory
+            if self.trajectory_valid and len(self.predicted_trajectory) > 1:
+                first_point = self.predicted_trajectory[0]
+                distance = np.sqrt((first_point[0] - x0[0])**2 + (first_point[1] - x0[1])**2)
+                print(f"Final trajectory first point: ({first_point[0]:.2f}, {first_point[1]:.2f}), distance: {distance:.2f}m")
+            
+            return u_opt[:, 0]
+            
         except Exception as e:
             print(f"MPC solver error: {e}")
             self.trajectory_valid = False
@@ -696,23 +702,43 @@ class CarlaMPCClient:
                 
                 self.vehicle.apply_control(control)
                 
-                self.visualizer.draw_reference_path(
-                [(wp[0], wp[1]) for wp in self.reference_path])
+                # Clear the previous debug drawings
+                self.world.debug.draw_string(carla.Location(0, 0, 0), "ClearAll", color=carla.Color(0, 0, 0), life_time=0.01)
 
-                if self.mpc.trajectory_valid and self.mpc.predicted_trajectory:
-                    self.visualizer.draw_predicted_trajectory(self.mpc.predicted_trajectory)
-                else:
-                    print("Invalid trajectory, not drawing")
+                # Draw reference path
+                self.visualizer.draw_reference_path([(wp[0], wp[1]) for wp in self.reference_path])
 
+                # Draw waypoints
                 if self.carla_waypoints:
                     self.visualizer.draw_waypoints(self.carla_waypoints)
+
+                # Draw predicted trajectory - CRITICAL PART
+                if self.mpc.trajectory_valid and self.mpc.predicted_trajectory:
+                    # Check if trajectory first point is close to vehicle
+                    vehicle_pos = np.array([x0[0], x0[1]])
+                    traj_first = np.array(self.mpc.predicted_trajectory[0])
+                    dist = np.linalg.norm(traj_first - vehicle_pos)
                     
-                self.visualizer.draw_predicted_trajectory(self.mpc.predicted_trajectory)
-                self.visualizer.draw_vehicle_info(
-                    control.steer, control.throttle, control.brake, 
-                    3.6 * x0[3],
-                    self.lateral_error
-                )
+                    if dist < 10.0:  # Only draw if reasonably close
+                        self.visualizer.draw_predicted_trajectory(self.mpc.predicted_trajectory)
+                    else:
+                        print(f"Not drawing trajectory: first point too far ({dist:.2f}m)")
+                        # Force the first point to match vehicle position
+                        if len(self.mpc.predicted_trajectory) > 1:
+                            fixed_trajectory = [(x0[0], x0[1])] + self.mpc.predicted_trajectory[1:]
+                            self.visualizer.draw_predicted_trajectory(fixed_trajectory)
+                else:
+                    print("No valid trajectory to draw")
+
+                # if self.carla_waypoints:
+                #     self.visualizer.draw_waypoints(self.carla_waypoints)
+                    
+                # self.visualizer.draw_predicted_trajectory(self.mpc.predicted_trajectory)
+                # self.visualizer.draw_vehicle_info(
+                #     control.steer, control.throttle, control.brake, 
+                #     3.6 * x0[3],
+                #     self.lateral_error
+                # )
                 
                 self.visualizer.render()
                 
