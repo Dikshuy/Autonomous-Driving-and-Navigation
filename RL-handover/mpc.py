@@ -1,175 +1,434 @@
-from typing import Tuple, Optional, List
+#!/usr/bin/env python3
+
+"""
+2D Controller Class to be used for the CARLA waypoint follower demo.
+"""
 import numpy as np
-import casadi as ca
-import matplotlib.pyplot as plt
+import math
+from matplotlib import pyplot as plt
+import cvxpy
 
+class MPCParams:
+    # State Cost
+    # Q = np.eye(4)
+    Q = np.array([[  2.5,  0,  0,  0],
+                  [  0,  2.5,  0,  0],
+                  [  0,  0,  1.1,  0],
+                  [  0,  0,  0,  5.5]])
 
-class BicycleMPC:
-    """
-    Model Predictive Controller for a Bicycle Kinematic Model.
-    """
+    # Terminal Cost
+    Qf = np.array([[  3.5,  0,  0,  0],
+                  [  0,  3.5,  0,  0],
+                  [  0,  0,  1.5,  0],
+                  [  0,  0,  0,  3.5]])
 
-    def __init__(
-        self, 
-        wheelbase: float = 2.5, 
-        velocity: float = 7.0, 
-        horizon_length: int = 5, 
-        time_step: float = 0.1
-    ):
-        self.L = wheelbase
-        self.v = velocity
-        self.N = horizon_length
-        self.dt = time_step
-        
-        self.Q = np.eye(3)
-        
-        self.R = np.eye(1)
+    # Control Cost 1) acceleration 2) steer rate
+    R = np.eye(2)
 
-    def create_bicycle_model(self) -> ca.Function:
-        x = ca.MX.sym('x')
-        y = ca.MX.sym('y')
-        theta = ca.MX.sym('theta')
-        state = ca.vertcat(x, y, theta)
-        
-        delta = ca.MX.sym('delta')
-        control = ca.vertcat(delta)
+    dist = 3.5
 
-        x_next = x + self.v * ca.cos(theta) * self.dt
-        y_next = y + self.v * ca.sin(theta) * self.dt
-        theta_next = theta + (self.v / self.L) * ca.tan(delta) * self.dt
-        
-        next_state = ca.vertcat(x_next, y_next, theta_next)
-        
-        return ca.Function('bicycle_model', [state, control], [next_state])
+    # State change cost
+    Rd = np.array([[1, 0],
+                   [0 ,1]])
+
+    # Horizon
+    len_horizon = 10
+
+    # Constrains
+    max_steering_angle = 1.0
+
+    a_max = 5
+
+    a_min = -0.01
+    
+    a_rate_max = 1
+    
+    steer_rate_max = 0.5
+    
+    v_min = -1
+    
+    v_max = 80
+
+class MPC:
+    def __init__(self, x=0, y=0, yaw=0, v=0, delta=0,
+                 max_steering_angle=1.22, lf = 1.5 , lr = 1.5, L=3, Q=np.eye(4), Qf=np.eye(4),
+                 R=np.eye(2), Rd=np.eye(2), len_horizon=5, a_max=2, a_min=-1,
+                 a_rate_max=1, steer_rate_max=0.5, v_min=-1, v_max=80, dist = 1.5, time_step = 0.1):
+
+        # States
+        self.x = x
+        self.y = y
+        self.yaw = yaw
+        self.v = v
+
+        # Steering angle
+        self.delta = delta
+        self.max_steering_angle = max_steering_angle
+
+        # Wheel base
+        self.lf = lf
+        self.lr = lr
+        self.L = L
+
+        # Control gain
+        self.Q = Q
+        self.R = R
+        self.Rd = Rd
+        self.Qf = Qf
+
+        #forward time step
+        self.time_step = time_step
+
+        self.len_horizon = len_horizon
+
+        self.v_min = v_min
+        self.v_max = v_max
+        self.a_max = a_max
+        self.a_min = a_min
+        self.a_rate_max = a_rate_max
+        self.steer_rate_max = steer_rate_max
+        self.dist = dist
+
+        self.prev_idx = 0
+        self.send_prev = 0
+        self.prev_accelerations = np.array([0.0] * self.len_horizon)
+        self.prev_deltas = np.array([0.0] * self.len_horizon)
+        self.prev_index = 0
+    
+    def update_state(self, x, y, v, yaw):
+        self.x = x
+        self.y = y
+        self.v = v
+        self.yaw = yaw
+
+    def update_position(self, x, y):
+        self.x = x
+        self.y = y
+
+    def update_speed(self, v):
+        self.v = v
+
+    def update_yaw(self, yaw):
+        self.yaw = yaw
 
     @staticmethod
-    def generate_reference_trajectory(
-        t_values: np.ndarray, 
-        t0: float = 10.0, 
-        alpha: float = 1.0
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        y_values = 1 / (1 + np.exp(-alpha * (t_values - t0)))
-        return t_values, y_values
+    def bound_angles(theta):
+        if theta > np.pi:
+            theta = theta - 2*np.pi
+        elif theta < -np.pi:
+            theta = theta + 2*np.pi
 
-    def cost_function(
-        self, 
-        state: ca.MX, 
-        control: ca.MX, 
-        target: ca.MX, 
-        control_prev: Optional[ca.MX] = None
-    ) -> ca.MX:
-        state_cost = ca.mtimes((state[:2] - target).T, self.Q[:2, :2] @ (state[:2] - target))
-        
-        control_cost = ca.mtimes(control.T, self.R @ control)
-        
-        if control_prev is not None:
-            jerk_penalty = ca.sumsqr(control - control_prev)
+        return theta
+
+    def find_closest_waypoint(self, cx, cy):
+        distances = np.sum(( np.array([[self.x], [self.y]]) -
+                             np.stack((cx, cy)) )**2, axis=0)
+        idx = np.argmin(distances)
+
+        return idx, cx[idx], cy[idx]
+
+    def get_linearized_dynamics(self, yaw, delta, v, dt=0.01):
+        # A = np.eye(4)
+        # A[0, 2] = np.cos(yaw) * dt
+        # A[0, 3] = -v * np.sin(yaw) * dt
+        # A[1, 2] = np.sin(yaw) * dt
+        # A[1, 3] = v * np.cos(yaw) * dt
+        # A[3, 2] = np.tan(delta) * dt / self.L
+
+        # B = np.zeros((4, 2))
+        # B[2, 0] = dt
+        # B[3, 1] = v * dt / (self.L * np.cos(delta)**2)
+
+        # C = np.zeros((4, 1))
+        # C[0, 0] = v * np.sin(yaw) * yaw * dt
+        # C[1, 0] = - v * np.cos(yaw) * yaw * dt
+        # C[3, 0] = - v * delta * dt / (self.L * np.cos(delta)**2)
+
+        tandelta = math.tan(delta)
+        angel = yaw + math.atanh((self.lr*tandelta)/self.L)
+        deno1 = np.tan(delta)**2 + 1
+        deno2 = (self.lr**2*tandelta**2)/self.L**2 + 1
+        deno3 = self.L * np.sqrt(deno2)
+        # print(f"angles {yaw}, {angel}, {tandelta}")
+
+        A = np.array([[ 0, 0, np.cos(angel), -v*np.sin(angel)],
+                    [ 0, 0, np.sin(angel),  v*np.cos(angel)],
+                    [ 0, 0, 0, 0],
+                    [ 0, 0, tandelta/deno3, 0]]) * dt
+        A = A + np.eye(4)
+
+        B = np.array([[ 0, -(self.lr*v*np.sin(angel)*(deno1))/(self.L*(deno2))],
+                    [ 0, (self.lr*v*np.cos(angel)*(deno1))/(self.L*(deno2))],
+                    [ 1, 0],
+                    [ 0, (v*(deno1))/deno3 - (self.lr**2*v*tandelta**2*(deno1))/(deno3**3)]])
+        B *= dt
+
+        C = np.zeros((4, 1))
+        C[0, 0] = yaw*v*np.sin(angel) + (delta*self.lr*v*np.sin(angel)*deno1)/(self.L*(deno2))
+        C[1, 0] = -yaw*v*np.cos(angel) - (delta*self.lr*v*np.cos(angel)*deno1)/(self.L*(deno2))
+        C[2, 0] = 0
+        C[3, 0] = -delta*(v*deno1)/(deno3) - (self.lr**2*v*tandelta**2*deno1)/(deno3**3)
+        C *= dt
+
+        return A, B, C
+
+    def linear_mpc(self, z_ref, z_initial, prev_deltas, dt):
+        z = cvxpy.Variable((4, self.len_horizon + 1))
+        u = cvxpy.Variable((2, self.len_horizon))
+
+        cost = 0
+        constraints = [z[:, 0] == z_initial.flatten()]
+        for i in range(self.len_horizon - 1):
+            ## Cost
+            if i != 0:
+                cost += cvxpy.quad_form(z_ref[:, i] - z[:, i], self.Q)
+                cost += cvxpy.quad_form(u[:, i] - u[:, i-1], self.Rd)
+            else:
+                u_prev = [self.prev_accelerations[0], self.prev_deltas[0]]
+                cost += cvxpy.quad_form(u[:, i] - u_prev, self.Rd)
+
+            cost += cvxpy.quad_form(u[:, i], self.R)
+
+            ## Constraints
+            A, B, C = self.get_linearized_dynamics(z_ref[3, i], self.prev_deltas[np.min([ i + 1, len(self.prev_deltas) - 1])],
+                                                z_ref[2, i], dt)
+
+            constraints += [z[:, i+1] == A @ z[:, i] + B @ u[:, i] + C.flatten()]
+
+            # Velocity limits
+            constraints += [z[2, i] <= self.v_max]
+            constraints += [z[2, i] >= self.v_min]
+
+            # Input limits
+            constraints += [self.a_min <= u[0, i]]
+            constraints += [u[0, i] <= self.a_max]
+            constraints += [u[1, i] <= self.max_steering_angle]
+            constraints += [u[1, i] >= -self.max_steering_angle]
+            # Rate of change of input limit
+            if i != 0:
+                constraints += [u[0, i] - u[0, i-1] <= self.a_rate_max]
+                constraints += [u[0, i] - u[0, i-1] >= -self.a_rate_max]
+                constraints += [u[1, i] - u[1, i-1] <= self.steer_rate_max * dt]
+                constraints += [u[1, i] - u[1, i-1] >= -self.steer_rate_max * dt]
+                constraints += [(z[0, i + 1] - z_ref[0, i])*np.sin(z_ref[3,i]) <= self.dist]
+                constraints += [(z[0, i + 1] - z_ref[0, i])*np.sin(z_ref[3,i]) >= -self.dist]
+                constraints += [(z[1, i + 1] - z_ref[1, i])*np.cos(z_ref[3,i]) <= self.dist]
+                constraints += [(z[1, i + 1] - z_ref[1, i])*np.cos(z_ref[3,i]) >= -self.dist]
+
+        # Terminal cost
+        cost += cvxpy.quad_form(z_ref[:, -1] - \
+                                z[:, -1], self.Qf)
+
+        # Quadratic Program
+        qp = cvxpy.Problem(cvxpy.Minimize(cost), constraints)
+        qp.solve(solver=cvxpy.ECOS, verbose=False)
+
+        if qp.status == cvxpy.OPTIMAL or qp.status == cvxpy.OPTIMAL_INACCURATE:
+            x = np.array(z.value[0, :]).flatten()
+            y = np.array(z.value[1, :]).flatten()
+            v = np.array(z.value[2, :]).flatten()
+            yaw = np.array(z.value[3, :]).flatten()
+            a = np.array(u.value[0, :]).flatten()
+            delta = np.array(u.value[1, :]).flatten()
         else:
-            jerk_penalty = 0
-        
-        return ca.sum1(state_cost) + ca.sum1(control_cost) + jerk_penalty
+            # x, y, v, yaw, a, delta = None, None, None, None, None, None
+            a, delta = None, None
 
-    def run_mpc_simulation(self) -> Tuple[List[float], List[float], List[float]]:
-        bicycle_model = self.create_bicycle_model()
+        return a, delta
 
-        t_values = np.linspace(0, 20, 50)
-        target_x, target_y = self.generate_reference_trajectory(t_values)
+    def get_ref_traj(self, cx, cy, cyaw, ck, vel, prev_idx, dt=0.01):
+        x_ref = np.zeros((4, self.len_horizon+1))
+        idx, target_x, target_y = self.find_closest_waypoint(cx, cy)
+        if idx <= prev_idx:
+            idx = prev_idx
+            target_x = cx[idx]
+            target_y = cy[idx]
 
-        opti = ca.Opti()
-        X = opti.variable(3, self.N + 1)  # State trajectory
-        U = opti.variable(1, self.N)      # Control inputs
+        x_ref[0, 0] = cx[idx]
+        x_ref[1, 0] = cy[idx]
+        x_ref[2, 0] = vel[idx]
+        x_ref[3, 0] = cyaw[idx]
 
-        opti.set_initial(X, 0)
-        opti.set_initial(U, 0)
+        idxs = [idx]
+        path_length = 0
+        next_idx = idx
+        for i in range(self.len_horizon):
+            path_length += abs(vel[idx]) * dt
+            while next_idx < len(cx):
+                if (cx[idx] - cx[next_idx])**2 + (cy[idx] - cy[next_idx])**2 > path_length**2:
+                    x_ref[0, i+1] = cx[next_idx]
+                    x_ref[1, i+1] = cy[next_idx]
+                    x_ref[2, i+1] = vel[next_idx]
+                    x_ref[3, i+1] = cyaw[next_idx]
+                    idxs.append(next_idx)
+                    next_idx += 1
+                    break
+                next_idx += 1
+            if next_idx == len(cx):
+                x_ref[0, i+1] = cx[-1]
+                x_ref[1, i+1] = cy[-1]
+                x_ref[2, i+1] = vel[-1]
+                x_ref[3, i+1] = cyaw[-1]
+                idxs.append(len(cx)-1)
 
-        target_param = opti.parameter(2, self.N)
+        return idxs, x_ref
 
-        previous_control = np.zeros(1)
+    def get_inputs(self, x, y, yaw, v, waypoints):
+        self.update_position(x, y)
+        self.update_yaw(yaw)
+        self.update_speed(v)
 
-        objective = 0
+        x0 = np.array([[x], [y], [v], [yaw]])
 
-        for k in range(self.N):
-            current_state = X[:, k]
-            next_state = X[:, k + 1]
-            control_input = U[:, k]
+        accelerations, deltas = self.linear_mpc(waypoints, x0, self.prev_deltas, dt=self.time_step)
 
-            control_previous = previous_control if k == 0 else U[:, k - 1]
-            
-            target = target_param[:, k]
-            
-            objective += self.cost_function(current_state, control_input, target, control_previous)
+        if accelerations is None:
+            self.prev_accelerations = self.prev_accelerations[1:]
+            self.prev_deltas = self.prev_deltas[1:]
+        else:
+            self.prev_accelerations = accelerations
+            self.prev_deltas = deltas
 
-        for k in range(self.N):
-            opti.subject_to(X[:, k+1] == bicycle_model(X[:, k], U[:, k]))
-        
-        opti.subject_to(opti.bounded(-np.pi/4, U[0, :], np.pi/4))
+        return self.prev_accelerations[0], self.prev_deltas[0]
 
-        opti.minimize(objective)
-        opti.solver('ipopt')
+class Controller(object):
+    def __init__(self, waypoints = None, lf = 1.5, lr = 1.5, wheelbase = 2.89, planning_horizon = 10, time_step = 0.1):
+        self._lookahead_distance = 3.0
+        self._lookahead_time = 1.0
+        self._current_x = 0
+        self._current_y = 0
+        self._current_yaw = 0
+        self._current_speed = 0
+        self._desired_speed = 0
+        self._current_frame = 0
+        self._current_timestamp = 0
+        self._start_control_loop = False
+        self._set_throttle = 0
+        self._set_brake = 0
+        self._set_steer = 0
+        self._waypoints = waypoints
+        self._conv_rad_to_steer = 180.0 / 70.0 / np.pi
+        self.controller = MPC(  x = self._current_x, y = self._current_y, yaw = self._current_yaw, v = self._current_speed, delta = 0,
+                                lf = lf, lr = lr ,L = wheelbase, Q = MPCParams.Q, R = MPCParams.R, Qf = MPCParams.Qf, Rd = MPCParams.Rd, len_horizon = planning_horizon,
+                                dist = MPCParams.dist, max_steering_angle = MPCParams.max_steering_angle, steer_rate_max = MPCParams.steer_rate_max, a_max = MPCParams.a_max, a_min = MPCParams.a_min, a_rate_max = MPCParams.a_rate_max, v_min = MPCParams.v_min, v_max = MPCParams.v_max, time_step=time_step)
 
-        x_trajectory: List[float] = []
-        y_trajectory: List[float] = []
-        steering_angle_all: List[float] = []
-        current_state = np.array([0, 0, 0])
+    def update_values(self, x, y, yaw, speed, timestamp, frame):
+        self._current_x = x
+        self._current_y = y
+        self._current_yaw = yaw
+        self._current_speed = speed
+        self._current_timestamp = timestamp
+        self._current_frame = frame
+        self.controller.update_position(x, y)
+        self.controller.update_speed(speed)
+        self.controller.update_yaw(yaw)
+        if self._current_frame:
+            self._start_control_loop = True
+        return self._start_control_loop
 
-        time_steps = np.arange(len(target_x)) * self.dt
-        for t in range(len(target_x) - self.N):
-            opti.set_initial(X[:, 0], current_state)
+    def get_lookahead_index(self, lookahead_distance):
+        min_idx = 0
+        min_dist = float("inf")
+        for i in range(len(self._waypoints)):
+            dist = np.linalg.norm(np.array([
+                self._waypoints[i][0] - self._current_x,
+                self._waypoints[i][1] - self._current_y]))
+            if dist < min_dist:
+                min_dist = dist
+                min_idx = i
 
-            target_segment = np.vstack((target_x[t:t + self.N], target_y[t:t + self.N]))
-            opti.set_value(target_param, target_segment)
+        total_dist = min_dist
+        lookahead_idx = min_idx
+        for i in range(min_idx + 1, len(self._waypoints)):
+            if total_dist >= lookahead_distance:
+                break
+            total_dist += np.linalg.norm(np.array([
+                self._waypoints[i][0] - self._waypoints[i-1][0],
+                self._waypoints[i][1] - self._waypoints[i-1][1]]))
+            lookahead_idx = i
+        return lookahead_idx
 
-            solution = opti.solve()
+    def update_desired_speed(self):
+        min_idx = 0
+        min_dist = float("inf")
+        desired_speed = 0
+        for i in range(len(self._waypoints)):
+            dist = np.linalg.norm(np.array([
+                self._waypoints[i][0] - self._current_x,
+                self._waypoints[i][1] - self._current_y]))
+            if dist < min_dist:
+                min_dist = dist
+                min_idx = i
+        self._desired_speed = self._waypoints[min_idx][2]
 
-            optimal_u = solution.value(U[:, 0])
-            previous_control = optimal_u
+    def smooth_yaw(self, yaws):
+        for i in range(len(yaws) - 1):
+            dyaw = yaws[i+1] - yaws[i]
 
-            current_state = solution.value(X[:, 1])
-            
-            x_trajectory.append(current_state[0])
-            y_trajectory.append(current_state[1])
-            steering_angle_all.append(optimal_u)
+            while dyaw >= np.pi/2.0:
+                yaws[i+1] -= 2.0 * np.pi
+                dyaw = yaws[i+1] - yaws[i]
 
-        return x_trajectory, y_trajectory, steering_angle_all
+            while dyaw <= -np.pi/2.0:
+                yaws[i+1] += 2.0 * np.pi
+                dyaw = yaws[i+1] - yaws[i]
 
-    def visualize_results(
-        self, 
-        x_trajectory: List[float], 
-        y_trajectory: List[float], 
-        steering_angles: List[float]
-    ):
-        t_values = np.linspace(0, 20, 50)
-        target_x, target_y = self.generate_reference_trajectory(t_values)
-        time_steps = np.arange(len(target_x)) * self.dt
+        return yaws
 
-        plt.figure(figsize=(12, 8))
-        
-        plt.subplot(2, 1, 1)
-        plt.plot(x_trajectory, y_trajectory, marker='o', label='Actual Trajectory')
-        plt.plot(target_x, target_y, 'r--', label='Desired Trajectory')
-        plt.title('Vehicle Trajectory')
-        plt.xlabel('X Position (m)')
-        plt.ylabel('Y Position (m)')
-        plt.legend()
-        plt.grid(True)
+    def update_waypoints(self, new_waypoints):
+        self._waypoints = new_waypoints
 
-        plt.subplot(2, 1, 2)
-        plt.plot(time_steps[:len(steering_angles)], steering_angles, label='Steering Angle (rad)')
-        plt.title('Control Inputs over Time')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Steering Angle (rad)')
-        plt.legend()
-        plt.grid(True)
+    def get_commands(self):
+        return self._set_throttle, self._set_steer, self._set_brake
 
-        plt.tight_layout()
-        plt.show()
-        
-def main():
-    mpc = BicycleMPC()
+    def set_throttle(self, input_throttle):
+        # Clamp the throttle command to valid bounds
+        throttle = np.fmax(np.fmin(input_throttle, 1.0), 0.0)
+        self._set_throttle = throttle
 
-    x_traj, y_traj, steering_angles = mpc.run_mpc_simulation()
+    def set_steer(self, input_steer_in_rad):
+        # Covnert radians to [-1, 1]
+        input_steer = self._conv_rad_to_steer * input_steer_in_rad
 
-    mpc.visualize_results(x_traj, y_traj, steering_angles)
+        # Clamp the steering command to valid bounds
+        steer = np.fmax(np.fmin(input_steer, 1.0), -1.0)
+        self._set_steer = steer
 
-if __name__ == "__main__":
-    main()
+    def set_brake(self, input_brake):
+        # Clamp the steering command to valid bounds
+        brake = np.fmax(np.fmin(input_brake, 1.0), 0.0)
+        self._set_brake = brake
+
+    def update_controls(self):
+        ######################################################
+        # RETRIEVE SIMULATOR FEEDBACK
+        ######################################################
+        x = self._current_x
+        y = self._current_y
+        yaw = self._current_yaw
+        v = self._current_speed
+        throttle_output = 0
+        steer_output = 0
+        brake_output = 0
+
+        # Skip the first frame to store previous values properly
+        if self._start_control_loop:
+            acceleration, steer_output = \
+                self.controller.get_inputs(x, y, yaw, v, np.array(self._waypoints).T)
+
+            ######################################################
+            # SET CONTROLS OUTPUT
+            ######################################################
+        if acceleration > 0:
+            # throttle_output = np.tanh(acceleration)
+            # throttle_output = max(0.0, min(1.0, throttle_output))
+            throttle_output = acceleration / MPCParams.a_max + 0.3
+            brake_output = 0.0
+        else:
+            throttle_output = 0.0
+            brake_output = acceleration / MPCParams.a_min  
+        # throttle_output = acceleration / MPCParams.a_max + 0.3
+        # print(f"Control input , throttle : {throttle_output}, steer outout : {steer_output}, brake : {brake_output}, acceleration : {acceleration}")
+        self.set_throttle(throttle_output)  # in percent (0 to 1)
+        self.set_steer(steer_output)        # in rad (-1.22 to 1.22)
+        self.set_brake(brake_output)        # in percent (0 to 1)
