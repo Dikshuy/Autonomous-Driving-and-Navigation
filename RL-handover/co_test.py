@@ -57,8 +57,11 @@ class MPCController:
         self.Qf = np.diag([10.0, 10.0, 1.0, 1.0])
 
         self.predicted_trajectory = []
-
         self.trajectory_valid = False
+        
+        # Add previous solution storage for warm start
+        self.prev_u = None
+        self.prev_x = None
 
         self.init_mpc()
         
@@ -83,6 +86,7 @@ class MPCController:
             error = st - x_ref
             cost += ca.mtimes([error.T, self.Q, error]) + ca.mtimes([con.T, self.R, con])
             
+            # Handle heading error properly with circular difference
             heading_error = ca.if_else(
                 ca.fabs(st[2] - x_ref[2]) > ca.pi,
                 ca.fabs(st[2] - x_ref[2]) - 2*ca.pi,
@@ -90,6 +94,7 @@ class MPCController:
             )
             cost += 5.0 * heading_error * heading_error
             
+            # RK4 integration for more accurate dynamics
             k1 = self.f(st, con)
             k2 = self.f(st + self.dt/2 * k1, con)
             k3 = self.f(st + self.dt/2 * k2, con)
@@ -146,72 +151,110 @@ class MPCController:
         self.ubx = ubx
         
     def solve(self, x0, x_ref):
-        u0 = ca.DM.zeros((self.n_controls, self.N))
-        X0 = ca.DM.zeros((self.n_states, self.N+1))
-        
-        X0[:, 0] = x0
-        
-        print(f"MPC initial state: x={x0[0]:.2f}, y={x0[1]:.2f}")
-        
-        curr_state = x0.copy()
-        for i in range(1, self.N+1):
-            if i-1 < self.N:
-                u0[0, i-1] = 0.0
-                u0[1, i-1] = 0.0
+        # Initialize with zeros or previous solution for warm start
+        if self.prev_u is not None and self.prev_x is not None:
+            # Shift previous solution for warm start
+            u0 = ca.DM.zeros((self.n_controls, self.N))
+            X0 = ca.DM.zeros((self.n_states, self.N+1))
             
-            next_x = curr_state[0] + curr_state[3] * np.cos(curr_state[2]) * self.dt
-            next_y = curr_state[1] + curr_state[3] * np.sin(curr_state[2]) * self.dt
-            next_psi = curr_state[2]
-            next_v = curr_state[3]
+            # Shift states and keep last state
+            X0[:, 0:self.N] = self.prev_x[:, 1:self.N+1]
+            X0[:, self.N] = self.prev_x[:, self.N]
             
-            curr_state = np.array([next_x, next_y, next_psi, next_v])
-            X0[:, i] = curr_state
+            # Shift controls and keep last control
+            u0[:, 0:self.N-1] = self.prev_u[:, 1:self.N]
+            u0[:, self.N-1] = self.prev_u[:, self.N-1]
+        else:
+            u0 = ca.DM.zeros((self.n_controls, self.N))
+            X0 = ca.DM.zeros((self.n_states, self.N+1))
+            
+            # Initialize with good guess for initial trajectory based on current state
+            X0[:, 0] = x0
+            
+            # Forward simulate with simple model to get better initial guess
+            curr_state = x0.copy()
+            for i in range(1, self.N+1):
+                # Simple forward Euler integration
+                next_x = curr_state[0] + curr_state[3] * np.cos(curr_state[2]) * self.dt
+                next_y = curr_state[1] + curr_state[3] * np.sin(curr_state[2]) * self.dt
+                next_psi = curr_state[2]
+                next_v = curr_state[3]
+                
+                curr_state = np.array([next_x, next_y, next_psi, next_v])
+                X0[:, i] = curr_state
         
+        # Debug prints
+        print(f"MPC initial state: x={x0[0]:.2f}, y={x0[1]:.2f}, psi={x0[2]:.2f}, v={x0[3]:.2f}")
+        print(f"Target state: x={x_ref[0]:.2f}, y={x_ref[1]:.2f}, psi={x_ref[2]:.2f}, v={x_ref[3]:.2f}")
+        
+        # Set parameters
         p = ca.vertcat(x0, x_ref)
         
+        # Set initial values for the NLP solver
         init_var = ca.vertcat(
             X0.reshape((-1, 1)),
             u0.reshape((-1, 1)))
         
-        sol = self.solver(
-            x0=init_var,
-            lbx=self.lbx,
-            ubx=self.ubx,
-            p=p,
-            lbg=0,
-            ubg=0)
-        
-        opt_var = sol['x'].full()
-        
-        self.predicted_trajectory = []
-        pred_states = opt_var[:self.n_states*(self.N+1)].reshape((self.n_states, self.N+1))
-        
-        first_x = float(pred_states[0, 0])
-        first_y = float(pred_states[1, 0])
-        vehicle_pos = np.array([x0[0], x0[1]])
-        traj_start = np.array([first_x, first_y])
-        distance = np.linalg.norm(traj_start - vehicle_pos)
-        
-        if distance > 5.0:  
-            print(f"Warning: Trajectory first point far from vehicle ({distance:.2f}m), rejecting solution")
+        # Solve the optimization problem
+        try:
+            sol = self.solver(
+                x0=init_var,
+                lbx=self.lbx,
+                ubx=self.ubx,
+                p=p,
+                lbg=0,
+                ubg=0)
+            
+            opt_var = sol['x'].full()
+            
+            # Extract solution
+            pred_states = opt_var[:self.n_states*(self.N+1)].reshape((self.n_states, self.N+1))
+            u_opt = opt_var[self.n_states*(self.N+1):].reshape((self.n_controls, self.N))
+            
+            # Store solution for next warm start
+            self.prev_x = pred_states
+            self.prev_u = u_opt
+            
+            # Validate solution - check if first point is close to vehicle
+            first_x = float(pred_states[0, 0])
+            first_y = float(pred_states[1, 0])
+            vehicle_pos = np.array([x0[0], x0[1]])
+            traj_start = np.array([first_x, first_y])
+            distance = np.linalg.norm(traj_start - vehicle_pos)
+            
+            # Debug info for trajectory starting point
+            print(f"Trajectory start: ({first_x:.2f}, {first_y:.2f}), Vehicle: ({x0[0]:.2f}, {x0[1]:.2f}), Distance: {distance:.2f}m")
+            
+            if distance > 5.0:  
+                print(f"Warning: Trajectory first point far from vehicle ({distance:.2f}m), rejecting solution")
+                self.trajectory_valid = False
+                self.predicted_trajectory = []
+                return np.array([0.0, 0.0])
+            
+            # Extract trajectory points for visualization
+            self.predicted_trajectory = []
+            for i in range(self.N+1):
+                x_pos = float(pred_states[0, i])
+                y_pos = float(pred_states[1, i])
+                
+                if not (math.isnan(x_pos) or math.isnan(y_pos) or 
+                        math.isinf(x_pos) or math.isinf(y_pos)):
+                    self.predicted_trajectory.append((x_pos, y_pos))
+            
+            self.trajectory_valid = len(self.predicted_trajectory) > 1
+            
+            if self.trajectory_valid:
+                print(f"Valid trajectory with {len(self.predicted_trajectory)} points")
+                return u_opt[:, 0]
+            else:
+                print("Invalid trajectory, using fallback control")
+                return np.array([0.0, 0.0])
+                
+        except Exception as e:
+            print(f"MPC solver error: {e}")
             self.trajectory_valid = False
             self.predicted_trajectory = []
             return np.array([0.0, 0.0])
-        
-        for i in range(self.N+1):
-            x_pos = float(pred_states[0, i])
-            y_pos = float(pred_states[1, i])
-            
-            if not (math.isnan(x_pos) or math.isnan(y_pos) or 
-                    math.isinf(x_pos) or math.isinf(y_pos)):
-                self.predicted_trajectory.append((x_pos, y_pos))
-
-        self.trajectory_valid = len(self.predicted_trajectory) > 1
-
-        u_opt = opt_var[self.n_states*(self.N+1):]
-        u_opt = u_opt.reshape((self.n_controls, self.N))
-
-        return u_opt[:, 0]
 
 class CarlaVisualizer:
     def __init__(self, world):
@@ -315,6 +358,9 @@ class CarlaVisualizer:
         self.camera.listen(self._process_image)
         
     def _process_image(self, image):
+        if not image:
+            return
+            
         array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
         array = np.reshape(array, (image.height, image.width, 4))
         array = array[:, :, :3]
@@ -323,6 +369,9 @@ class CarlaVisualizer:
         self.image_queue.append(array)
         
     def render(self):
+        if not self.image_queue:
+            return
+            
         image = self.image_queue[-1]
         surface = pygame.surfarray.make_surface(image.swapaxes(0, 1))
         self.display.blit(surface, (0, 0))
@@ -364,6 +413,12 @@ class CarlaMPCClient:
         self.fps = 0
         
         self.lateral_error = 0.0
+        
+        # Add safety controls
+        self.last_valid_control = carla.VehicleControl()
+        self.last_valid_control.steer = 0.0
+        self.last_valid_control.throttle = 0.0
+        self.last_valid_control.brake = 0.0
 
     def validate_coordinates(self):
         vehicle_state = self.get_vehicle_state()
@@ -374,6 +429,7 @@ class CarlaMPCClient:
 
         print(f"Vehicle position (CARLA): ({vehicle_loc.x:.2f}, {vehicle_loc.y:.2f})")
         print(f"Vehicle position (State): ({vehicle_state[0]:.2f}, {vehicle_state[1]:.2f})")
+        print(f"Vehicle heading: {np.degrees(vehicle_state[2]):.2f} degrees")
 
         if self.reference_path:
             first_wp = self.reference_path[0]
@@ -455,6 +511,7 @@ class CarlaMPCClient:
             y = wp.transform.location.y
             yaw = np.radians(wp.transform.rotation.yaw)
             
+            # Set target speed based on road type or curvature
             speed = 10.0
             
             self.reference_path.append((x, y, yaw, speed))
@@ -462,6 +519,9 @@ class CarlaMPCClient:
         print(f"Generated lane center path with {len(self.reference_path)} waypoints")
     
     def get_vehicle_state(self):
+        if not self.vehicle:
+            return None
+            
         transform = self.vehicle.get_transform()
         velocity = self.vehicle.get_velocity()
         
@@ -473,6 +533,9 @@ class CarlaMPCClient:
         return np.array([x, y, psi, v])
     
     def find_closest_waypoint(self, vehicle_state):
+        if not self.reference_path:
+            return 0
+            
         min_dist = float('inf')
         closest_idx = 0
         
@@ -513,92 +576,99 @@ class CarlaMPCClient:
         cross_prod = np.cross(v_vec, w_vec)
         return np.linalg.norm(cross_prod)
     
-    def find_closest_waypoint(self, vehicle_state):
-        if not self.reference_path:
-            return 0
-            
-        min_dist = float('inf')
-        closest_idx = 0
-        
-        for i, wp in enumerate(self.reference_path):
-            dist = np.sqrt((vehicle_state[0] - wp[0])**2 + (vehicle_state[1] - wp[1])**2)
-            if dist < min_dist:
-                min_dist = dist
-                closest_idx = i
-
-        if closest_idx < len(self.reference_path):
-            print(f"Distance to closest waypoint: {min_dist:.2f}m")
-            
-        return closest_idx
-
     def get_reference_state(self, target_idx, vehicle_state):
+        # Get the target waypoint from the reference path
         x_ref = np.array(self.reference_path[target_idx])
         
+        # Current vehicle position
         x_cur = vehicle_state[0]
         y_cur = vehicle_state[1]
         
+        # Calculate vector from vehicle to target
         dx = x_ref[0] - x_cur
         dy = x_ref[1] - y_cur
         distance = np.sqrt(dx*dx + dy*dy)
         
+        # Limit the maximum distance to prevent issues with MPC
         max_distance = 15.0
         if distance > max_distance:
+            # Scale the target to be closer
             scale = max_distance / distance
             adjusted_x = x_cur + dx * scale
             adjusted_y = y_cur + dy * scale
             
+            # Calculate desired heading based on the vector to the target
             psi_desired = np.arctan2(dy, dx)
             
+            # Use the target speed from the reference path
             v_desired = x_ref[3]
             
             return np.array([adjusted_x, adjusted_y, psi_desired, v_desired])
 
-        psi_desired = np.arctan2(dy, dx)
+        # Use the angle to the next waypoint for smoother tracking
+        psi_desired = x_ref[2]  # Use the waypoint's heading instead of calculating angle
         v_desired = x_ref[3]
+        
         return np.array([x_ref[0], x_ref[1], psi_desired, v_desired])
     
     def run(self):
-        self.visualizer.setup_camera()
-
-        self.generate_lane_center_path()
-        self.validate_coordinates()
-
-        warmup_control = carla.VehicleControl()
-        warmup_control.throttle = 0.7
-        warmup_control.steer = 0.0
-        warmup_control.brake = 0.0
-        self.vehicle.apply_control(warmup_control)
-        
-        for i in range(40):
-            self.world.tick()
-            if i % 10 == 0:
-                self.vehicle.apply_control(warmup_control)
-            time.sleep(0.05)
-        
-        # Main loop
         try:
+            self.visualizer.setup_camera()
+
+            # Generate initial path
+            self.generate_lane_center_path()
+            self.validate_coordinates()
+
+            # Start with a simple control to get the vehicle moving
+            warmup_control = carla.VehicleControl()
+            warmup_control.throttle = 0.7
+            warmup_control.steer = 0.0
+            warmup_control.brake = 0.0
+            self.vehicle.apply_control(warmup_control)
+            
+            # Give the vehicle time to start moving
+            for i in range(40):
+                self.world.tick()
+                if i % 10 == 0:
+                    self.vehicle.apply_control(warmup_control)
+                time.sleep(0.05)
+            
+            # Main control loop
             running = True
+            control_counter = 0  # For safety fallback
+
             while running:
                 self.world.tick()
+                # Check for quit events
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         running = False
 
+                # Calculate FPS
                 current_time = time.time()
                 self.fps = 1.0 / max(0.001, current_time - self.last_time)
                 self.last_time = current_time
                 
+                # Get current vehicle state
                 x0 = self.get_vehicle_state()
+                if x0 is None:
+                    print("Vehicle state is None, skipping iteration")
+                    continue
+                    
+                # Find closest waypoint and set target
                 closest_idx = self.find_closest_waypoint(x0)
                 
+                # Calculate lateral error for visualization
                 self.lateral_error = self.calculate_lateral_error(x0)
                 
+                # Look ahead for smoother tracking
                 look_ahead = min(5, len(self.reference_path) - closest_idx - 1)
                 target_idx = min(closest_idx + look_ahead, len(self.reference_path) - 1)
                 x_ref = self.get_reference_state(target_idx, x0)
 
                 self.current_target_idx = target_idx
                 
+                # Solve MPC optimization
                 u_opt = self.mpc.solve(x0, x_ref)
                 steering, acceleration = u_opt[0], u_opt[1]
 
