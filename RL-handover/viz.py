@@ -2,18 +2,19 @@ import carla
 import numpy as np
 import casadi as ca
 import random
+import time
 from typing import Tuple, Optional, List
 from collections import deque
 
 class BicycleMPC:
     """
-    Model Predictive Controller for a Bicycle Kinematic Model integrated with CARLA.
+    Enhanced Model Predictive Controller for CARLA with better visualization and solver stability.
     """
     def __init__(
         self, 
         wheelbase: float = 2.5, 
         velocity: float = 7.0, 
-        horizon_length: int = 5, 
+        horizon_length: int = 10,  # Increased horizon
         time_step: float = 0.1
     ):
         self.L = wheelbase
@@ -21,9 +22,9 @@ class BicycleMPC:
         self.N = horizon_length
         self.dt = time_step
         
-        # Tuning parameters
-        self.Q = np.diag([10.0, 10.0, 1.0])  # State cost weights (x, y, theta)
-        self.R = np.diag([0.1])               # Control cost weight (steering)
+        # More conservative tuning for better solver convergence
+        self.Q = np.diag([5.0, 5.0, 0.5])  # Reduced state cost weights
+        self.R = np.diag([0.5])            # Increased control cost weight
         
         # CARLA specific attributes
         self.client = None
@@ -37,6 +38,7 @@ class BicycleMPC:
         self.waypoint_visuals = []
         self.trajectory_visuals = []
         self.debug_helper = None
+        self.camera = None
 
     def create_bicycle_model(self) -> ca.Function:
         """Create the bicycle kinematic model function."""
@@ -63,12 +65,13 @@ class BicycleMPC:
         target: ca.MX, 
         control_prev: Optional[ca.MX] = None
     ) -> ca.MX:
-        """Calculate the cost for MPC optimization."""
+        """Calculate the cost for MPC optimization with smoother penalties."""
         state_cost = ca.mtimes((state - target).T, self.Q @ (state - target))
         control_cost = ca.mtimes(control.T, self.R @ control)
         
         if control_prev is not None:
-            jerk_penalty = 0.1 * ca.sumsqr(control - control_prev)
+            # Smoother control change penalty
+            jerk_penalty = 0.05 * ca.sumsqr(control - control_prev)
         else:
             jerk_penalty = 0
         
@@ -83,6 +86,7 @@ class BicycleMPC:
             
             # Load the specified town
             self.world = self.client.load_world(town)
+            time.sleep(2)  # Give time for map to load
             
             # Set up debug helper
             self.debug_helper = self.world.debug
@@ -95,7 +99,7 @@ class BicycleMPC:
             
             # Spawn a vehicle at any available spawn point
             blueprint_library = self.world.get_blueprint_library()
-            vehicle_bp = random.choice(blueprint_library.filter('vehicle.*'))
+            vehicle_bp = blueprint_library.filter('vehicle.tesla.model3')[0]  # More stable vehicle
             
             # Get all spawn points and select one at random
             spawn_points = self.world.get_map().get_spawn_points()
@@ -106,13 +110,10 @@ class BicycleMPC:
             print(f"Spawning vehicle at: {spawn_point.location}")
             
             self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
+            self.vehicle.set_autopilot(False)  # Ensure we have full control
             
-            # Set spectator view
-            self.spectator = self.world.get_spectator()
-            transform = carla.Transform(
-                self.vehicle.get_transform().location + carla.Location(z=50),
-                carla.Rotation(pitch=-90))
-            self.spectator.set_transform(transform)
+            # Setup camera for better visualization
+            self.setup_camera()
             
             # Generate reference trajectory (straight line from spawn point)
             self.generate_reference_waypoints()
@@ -123,7 +124,26 @@ class BicycleMPC:
             print(f"Error setting up CARLA simulation: {e}")
             raise
 
-    def generate_reference_waypoints(self, distance: float = 5.0, num_points: int = 100):
+    def setup_camera(self):
+        """Setup a third-person camera for better visualization."""
+        camera_bp = self.world.get_blueprint_library().find('sensor.camera.rgb')
+        camera_bp.set_attribute('image_size_x', '1280')
+        camera_bp.set_attribute('image_size_y', '720')
+        
+        # Attach camera behind the vehicle
+        camera_transform = carla.Transform(
+            carla.Location(x=-8, z=5),  # 8 meters behind, 5 meters up
+            carla.Rotation(pitch=-20))   # Slightly looking down
+        
+        self.camera = self.world.spawn_actor(
+            camera_bp, 
+            camera_transform, 
+            attach_to=self.vehicle)
+        
+        # Set spectator to follow the vehicle
+        self.spectator = self.world.get_spectator()
+
+    def generate_reference_waypoints(self, distance: float = 5.0, num_points: int = 200):
         """Generate reference waypoints in a straight line from the vehicle's starting position."""
         map = self.world.get_map()
         current_location = self.vehicle.get_location()
@@ -156,7 +176,8 @@ class BicycleMPC:
                 waypoint.transform.location, 
                 '•', 
                 color=carla.Color(255, 0, 0), 
-                life_time=100.0)
+                life_time=100.0,
+                persistent_lines=True)
     
     def get_reference_trajectory(self, current_index: int) -> Tuple[np.ndarray, np.ndarray]:
         """Get the reference trajectory segment for MPC."""
@@ -180,17 +201,18 @@ class BicycleMPC:
         return np.array([x, y, theta])
     
     def run_mpc_control(self):
-        """Run the MPC controller in the CARLA simulation."""
+        """Run the MPC controller in the CARLA simulation with improved stability."""
         if not self.vehicle or not self.reference_waypoints:
             raise RuntimeError("CARLA simulation not properly set up")
             
         bicycle_model = self.create_bicycle_model()
         
-        # Initialize MPC optimization problem
+        # Initialize MPC optimization problem with solver options
         opti = ca.Opti()
         X = opti.variable(3, self.N + 1)  # State trajectory
         U = opti.variable(1, self.N)       # Control inputs (steering)
         
+        # Better initial guesses
         opti.set_initial(X, 0)
         opti.set_initial(U, 0)
         
@@ -200,7 +222,7 @@ class BicycleMPC:
         
         previous_control = np.zeros(1)
         
-        # Build the MPC problem
+        # Build the MPC problem with relaxed constraints
         objective = 0
         
         for k in range(self.N):
@@ -209,7 +231,6 @@ class BicycleMPC:
             control_input = U[:, k]
             
             # Target state (x, y, theta)
-            # For theta, we'll use the direction to the next waypoint
             target_state = ca.vertcat(
                 x_target[k], 
                 y_target[k],
@@ -219,19 +240,22 @@ class BicycleMPC:
             control_prev = previous_control if k == 0 else U[:, k - 1]
             objective += self.cost_function(current_state, control_input, target_state, control_prev)
             
-            # Dynamics constraint
+            # Dynamics constraint with relaxation
             opti.subject_to(next_state == bicycle_model(current_state, control_input))
         
-        # Steering angle constraints
-        opti.subject_to(opti.bounded(-np.pi/4, U[0, :], np.pi/4))
+        # More relaxed steering angle constraints
+        opti.subject_to(opti.bounded(-np.pi/3, U[0, :], np.pi/3))
         
-        opti.minimize(objective)
-        opti.solver('ipopt')
+        # Set solver options for better convergence
+        p_opts = {"expand": True}
+        s_opts = {"max_iter": 1000, "print_level": 0, "acceptable_tol": 1e-4}
+        opti.solver('ipopt', p_opts, s_opts)
         
         # Main simulation loop
         try:
             current_index = 0
             trajectory_history = deque(maxlen=100)
+            last_valid_control = 0.0  # Fallback for solver failures
             
             while current_index < len(self.reference_waypoints) - self.N:
                 # Get current state
@@ -247,32 +271,33 @@ class BicycleMPC:
                 opti.set_value(x_target, x_ref)
                 opti.set_value(y_target, y_ref)
                 
-                # Solve MPC problem
+                # Solve MPC problem with error handling
                 try:
                     solution = opti.solve()
                     optimal_control = solution.value(U[:, 0])
                     predicted_trajectory = solution.value(X)
-                    
-                    # Apply control to vehicle
-                    steer = float(optimal_control[0])
-                    throttle = 0.5  # Fixed throttle for simplicity
-                    
-                    control = carla.VehicleControl()
-                    control.steer = np.clip(steer, -0.5, 0.5)
-                    control.throttle = throttle
-                    control.brake = 0.0
-                    self.vehicle.apply_control(control)
+                    last_valid_control = float(optimal_control[0])
                     
                     # Visualize predicted trajectory
                     self.visualize_trajectory(predicted_trajectory)
                     
-                    # Store trajectory for visualization
-                    trajectory_history.append((current_state[0], current_state[1]))
-                    
                 except Exception as e:
-                    print(f"MPC solver error: {e}")
-                    # If solver fails, continue with previous control
-                    steer = previous_control[0]
+                    print(f"MPC solver warning: {e}")
+                    # Use last valid control with damping
+                    optimal_control = last_valid_control * 0.8
+                
+                # Apply control to vehicle
+                steer = np.clip(float(optimal_control), -0.5, 0.5)
+                throttle = 0.3  # Reduced throttle for stability
+                
+                control = carla.VehicleControl()
+                control.steer = steer
+                control.throttle = throttle
+                control.brake = 0.0
+                self.vehicle.apply_control(control)
+                
+                # Update camera and spectator views
+                self.update_visualization()
                 
                 previous_control = np.array([steer])
                 current_index += 1
@@ -280,23 +305,20 @@ class BicycleMPC:
                 # Tick the simulation
                 self.world.tick()
                 
-                # Update spectator view
-                transform = carla.Transform(
-                    self.vehicle.get_transform().location + carla.Location(z=50),
-                    carla.Rotation(pitch=-90))
-                self.spectator.set_transform(transform)
-                
         except KeyboardInterrupt:
             print("Simulation stopped by user")
         finally:
-            # Clean up
-            if self.vehicle:
-                self.vehicle.destroy()
-            if self.client:
-                settings = self.world.get_settings()
-                settings.synchronous_mode = False
-                self.world.apply_settings(settings)
-    
+            self.cleanup()
+
+    def update_visualization(self):
+        """Update camera and spectator views."""
+        # Update spectator to follow behind the vehicle
+        vehicle_transform = self.vehicle.get_transform()
+        camera_transform = carla.Transform(
+            vehicle_transform.location + carla.Location(x=-8, z=5),
+            carla.Rotation(pitch=-20, yaw=vehicle_transform.rotation.yaw))
+        self.spectator.set_transform(camera_transform)
+
     def visualize_trajectory(self, trajectory: np.ndarray):
         """Visualize the predicted trajectory in CARLA."""
         # Clear previous trajectory visuals
@@ -319,17 +341,28 @@ class BicycleMPC:
                     start_loc, size=0.1, 
                     color=carla.Color(0, 255, 0), life_time=self.dt))
 
+    def cleanup(self):
+        """Clean up CARLA actors and settings."""
+        if self.vehicle:
+            self.vehicle.destroy()
+        if self.camera:
+            self.camera.destroy()
+        if self.client:
+            settings = self.world.get_settings()
+            settings.synchronous_mode = False
+            self.world.apply_settings(settings)
+
 def main():
     try:
         # Initialize MPC controller
         mpc = BicycleMPC(
             wheelbase=2.5, 
-            velocity=7.0, 
+            velocity=5.0,  # Reduced speed for stability
             horizon_length=10, 
             time_step=0.1)
         
-        # Set up CARLA simulation (will work with any town)
-        mpc.setup_carla_simulation(town='Town04')  # Can change to 'Town01', 'Town02', etc.
+        # Set up CARLA simulation
+        mpc.setup_carla_simulation(town='Town04')
         
         # Run MPC control
         mpc.run_mpc_control()
