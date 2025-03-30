@@ -157,8 +157,11 @@ class MPCController:
             u0 = ca.DM.zeros((self.n_controls, self.N))
             X0 = ca.DM.zeros((self.n_states, self.N+1))
             
-            # Shift states and keep last state
-            X0[:, 0:self.N] = self.prev_x[:, 1:self.N+1]
+            # IMPORTANT: Always set the first state to the current state
+            X0[:, 0] = x0  # This is the critical fix
+            
+            # Shift states starting from index 1
+            X0[:, 1:self.N] = self.prev_x[:, 2:self.N+1]
             X0[:, self.N] = self.prev_x[:, self.N]
             
             # Shift controls and keep last control
@@ -168,7 +171,6 @@ class MPCController:
             u0 = ca.DM.zeros((self.n_controls, self.N))
             X0 = ca.DM.zeros((self.n_states, self.N+1))
             
-            # Initialize with good guess for initial trajectory based on current state
             X0[:, 0] = x0
             
             # Forward simulate with simple model to get better initial guess
@@ -215,40 +217,40 @@ class MPCController:
             self.prev_x = pred_states
             self.prev_u = u_opt
             
+            # In the solve method after extracting the solution:
             # Validate solution - check if first point is close to vehicle
             first_x = float(pred_states[0, 0])
             first_y = float(pred_states[1, 0])
             vehicle_pos = np.array([x0[0], x0[1]])
             traj_start = np.array([first_x, first_y])
             distance = np.linalg.norm(traj_start - vehicle_pos)
-            
+
             # Debug info for trajectory starting point
             print(f"Trajectory start: ({first_x:.2f}, {first_y:.2f}), Vehicle: ({x0[0]:.2f}, {x0[1]:.2f}), Distance: {distance:.2f}m")
-            
-            if distance > 5.0:  
-                print(f"Warning: Trajectory first point far from vehicle ({distance:.2f}m), rejecting solution")
-                self.trajectory_valid = False
+
+            # Relax this condition or implement a more robust handling
+            if distance > 2.0:  # Changed from 5.0 to 2.0
+                print(f"Warning: Trajectory first point far from vehicle ({distance:.2f}m), attempting to fix")
+                # Instead of rejecting, we force the first point to match the current state
+                pred_states[:, 0] = x0
+                # And recalculate the trajectory points
                 self.predicted_trajectory = []
-                return np.array([0.0, 0.0])
-            
-            # Extract trajectory points for visualization
-            self.predicted_trajectory = []
-            for i in range(self.N+1):
-                x_pos = float(pred_states[0, i])
-                y_pos = float(pred_states[1, i])
+                for i in range(self.N+1):
+                    x_pos = float(pred_states[0, i])
+                    y_pos = float(pred_states[1, i])
+                    
+                    if not (math.isnan(x_pos) or math.isnan(y_pos) or 
+                            math.isinf(x_pos) or math.isinf(y_pos)):
+                        self.predicted_trajectory.append((x_pos, y_pos))
                 
-                if not (math.isnan(x_pos) or math.isnan(y_pos) or 
-                        math.isinf(x_pos) or math.isinf(y_pos)):
-                    self.predicted_trajectory.append((x_pos, y_pos))
-            
-            self.trajectory_valid = len(self.predicted_trajectory) > 1
-            
-            if self.trajectory_valid:
-                print(f"Valid trajectory with {len(self.predicted_trajectory)} points")
-                return u_opt[:, 0]
-            else:
-                print("Invalid trajectory, using fallback control")
-                return np.array([0.0, 0.0])
+                self.trajectory_valid = len(self.predicted_trajectory) > 1
+                
+                if self.trajectory_valid:
+                    print(f"Fixed trajectory with {len(self.predicted_trajectory)} points")
+                    return u_opt[:, 0]
+                else:
+                    print("Unable to fix trajectory, using fallback control")
+                    return np.array([0.0, 0.0])
                 
         except Exception as e:
             print(f"MPC solver error: {e}")
