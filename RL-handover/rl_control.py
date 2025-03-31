@@ -286,7 +286,7 @@ class CarlaHandoverEnv:
         
         reward = self._compute_reward(alpha)
         
-        done = self.current_step >= self.max_episode_steps or self._is_collision() or self._is_off_road()
+        done = self.current_step >= self.max_episode_steps or self._is_off_road()
         
         info = {
             'time': self.current_time,
