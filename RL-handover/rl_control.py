@@ -1,404 +1,575 @@
-import numpy as np
+import os
 import random
-import logging
-import matplotlib.pyplot as plt
-import mpc as MPCController
+from collections import deque, namedtuple
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import math
+import glob
+import sys
+from tqdm import tqdm
+
+try:
+    sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
+        sys.version_info.major,
+        sys.version_info.minor,
+        'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
+except IndexError:
+    pass
+
 import carla
-from ppo import RLHandoverController
-import pygame
-import argparse
-from pygame.locals import KMOD_CTRL, K_ESCAPE, K_q
-from main import World, HUD
 
-def wrap_angle(angle_in_degree):
-    """Convert degrees to radians and normalize to [-pi, pi]"""
-    angle_in_rad = angle_in_degree / 180.0 * np.pi
-    while angle_in_rad > np.pi:
-        angle_in_rad -= 2 * np.pi
-    while angle_in_rad <= -np.pi:
-        angle_in_rad += 2 * np.pi
-    return angle_in_rad
+import mpc as MPCController
 
-def get_vehicle_wheelbases(wheels, center_of_mass):
-    """Calculate vehicle wheelbase parameters from physics data"""
-    front_wheels = wheels[:2]
-    rear_wheels = wheels[2:]
-    
-    front_pos = np.mean([np.array([w.position.x, w.position.y, w.position.z]) for w in front_wheels], axis=0)
-    rear_pos = np.mean([np.array([w.position.x, w.position.y, w.position.z]) for w in rear_wheels], axis=0)
-    
-    wheelbase = np.sqrt(np.sum((front_pos - rear_pos)**2)) / 100.0  # Convert to meters
-    
-    return wheelbase - center_of_mass.x, center_of_mass.x, wheelbase
+# Parameters
+BUFFER_SIZE = int(1e5)  # Replay buffer size
+BATCH_SIZE = 64         # Minibatch size
+GAMMA = 0.99            # Discount factor
+TAU = 1e-3              # For soft update of target parameters
+LR = 5e-4               # Learning rate
+UPDATE_EVERY = 4        # How often to update the network
 
-# Simulated human MPC controller - this inherits from your existing MPCController
-class HumanMPCController(MPCController.Controller):
-    def __init__(self, waypoints=None, lf=1.5, lr=1.5, wheelbase=2.89, 
-                 planning_horizon=10, time_step=0.1, human_style='normal'):
-        super().__init__(waypoints, lf, lr, wheelbase, planning_horizon, time_step)
-        # Human driving style: 'normal', 'aggressive', 'cautious'
-        self.human_style = human_style
+# Device configuration
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+class QNetwork(nn.Module):
+    def __init__(self, state_size, action_size, seed, fc1_units=64, fc2_units=64):
+        super(QNetwork, self).__init__()
+        self.seed = torch.manual_seed(seed)
         
-        # Add human-like characteristics based on style
-        if human_style == 'aggressive':
-            # Aggressive driver: higher speeds, sharper steering
-            self.controller.a_max *= 1.2  # More aggressive acceleration
-            self.controller.v_max *= 1.1  # Higher speed
-            # Less weight on steering control cost - willing to make sharper turns
-            self.controller.R[1, 1] *= 0.8
-        elif human_style == 'cautious':
-            # Cautious driver: lower speeds, gentler steering
-            self.controller.a_max *= 0.8  # Less aggressive acceleration
-            self.controller.v_max *= 0.9  # Lower speed
-            # More weight on steering control cost - prefers gentler turns
-            self.controller.R[1, 1] *= 1.5
+        # Architecture for continuous action space (alpha)
+        self.fc1 = nn.Linear(state_size, fc1_units)
+        self.fc2 = nn.Linear(fc1_units, fc2_units)
+        self.fc3 = nn.Linear(fc2_units, action_size)
         
-        # Add random noise to simulate human inconsistency
-        self.noise_level = 0.05 if human_style == 'normal' else \
-                          0.1 if human_style == 'aggressive' else 0.02
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        
+        return torch.sigmoid(self.fc3(x))
+
+
+class ReplayBuffer:
+    def __init__(self, action_size, buffer_size, batch_size, seed):
+        self.action_size = action_size
+        self.memory = deque(maxlen=buffer_size)  
+        self.batch_size = batch_size
+        self.experience = namedtuple("Experience", field_names=["state", "action", "reward", "next_state", "done"])
+        self.seed = random.seed(seed)
     
-    def get_inputs(self, x, y, yaw, v, waypoints):
-        # Add small perturbations to the inputs to simulate human inconsistency
-        perturbed_x = x + np.random.normal(0, self.noise_level)
-        perturbed_y = y + np.random.normal(0, self.noise_level)
-        perturbed_yaw = yaw + np.random.normal(0, self.noise_level * 0.1)
-        perturbed_v = v + np.random.normal(0, self.noise_level * v)
-        
-        # Get control inputs using parent method with perturbed values
-        return super().get_inputs(perturbed_x, perturbed_y, perturbed_yaw, perturbed_v, waypoints)
+    def add(self, state, action, reward, next_state, done):
+        e = self.experience(state, action, reward, next_state, done)
+        self.memory.append(e)
     
-    def get_commands(self):
-        # Get baseline commands
-        throttle, steer, brake = super().get_commands()
+    def sample(self):
+        experiences = random.sample(self.memory, k=self.batch_size)
+
+        states = torch.from_numpy(np.vstack([e.state for e in experiences if e is not None])).float().to(device)
+        actions = torch.from_numpy(np.vstack([e.action for e in experiences if e is not None])).float().to(device)
+        rewards = torch.from_numpy(np.vstack([e.reward for e in experiences if e is not None])).float().to(device)
+        next_states = torch.from_numpy(np.vstack([e.next_state for e in experiences if e is not None])).float().to(device)
+        dones = torch.from_numpy(np.vstack([e.done for e in experiences if e is not None]).astype(np.uint8)).float().to(device)
+  
+        return (states, actions, rewards, next_states, dones)
+
+    def __len__(self):
+        return len(self.memory)
+
+
+class RLAgent:
+    def __init__(self, state_size, action_size, seed):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.seed = random.seed(seed)
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+
+        self.qnetwork_local = QNetwork(state_size, action_size, seed).to(device)
+        self.qnetwork_target = QNetwork(state_size, action_size, seed).to(device)
+        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=LR)
+
+        self.memory = ReplayBuffer(action_size, BUFFER_SIZE, BATCH_SIZE, seed)
+        self.t_step = 0
+    
+    def step(self, state, action, reward, next_state, done):
+        self.memory.add(state, action, reward, next_state, done)
+
+        self.t_step = (self.t_step + 1) % UPDATE_EVERY
+        if self.t_step == 0:
+            if len(self.memory) > BATCH_SIZE:
+                experiences = self.memory.sample()
+                self.learn(experiences, GAMMA)
+
+    def act(self, state, eps=0.):
+        state = torch.from_numpy(state).float().unsqueeze(0).to(device)
+        self.qnetwork_local.eval()
+        with torch.no_grad():
+            action_values = self.qnetwork_local(state)
+        self.qnetwork_local.train()
+
+        if random.random() > eps:
+            return action_values.cpu().data.numpy()
+        else:
+            return np.random.uniform(0, 1, size=(1, self.action_size))
+
+    def learn(self, experiences, gamma):
+        states, actions, rewards, next_states, dones = experiences
+
+        Q_targets_next = self.qnetwork_target(next_states).detach().max(1)[0].unsqueeze(1)
+        Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
+        Q_expected = self.qnetwork_local(states).gather(1, actions.long())
+
+        loss = F.mse_loss(Q_expected, Q_targets)
         
-        # Add some randomness to simulate human imprecision
-        throttle += np.random.normal(0, self.noise_level * 0.1)
-        throttle = max(0.0, min(1.0, throttle))
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        self.soft_update(self.qnetwork_local, self.qnetwork_target, TAU)  
         
-        steer += np.random.normal(0, self.noise_level * 0.1)
-        steer = max(-1.0, min(1.0, steer))
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def soft_update(self, local_model, target_model, tau):
+        for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
+            target_param.data.copy_(tau*local_param.data + (1.0-tau)*target_param.data)
+
+
+class HandoverController:
+    """Controller that blends MPC and human control during handover"""
+    
+    def __init__(self, mpc_controller, human_controller, handover_trigger_time=5.0, handover_duration=5.0):
+        self.mpc_controller = mpc_controller
+        self.human_controller = human_controller
+        self.handover_trigger_time = handover_trigger_time
+        self.handover_duration = handover_duration
+        self.handover_complete_time = handover_trigger_time + handover_duration
+
+        self.alpha = 0.0  # 0 = full autonomous, 1 = full human
         
-        brake += np.random.normal(0, self.noise_level * 0.05)
-        brake = max(0.0, min(1.0, brake))
+    def is_handover_active(self, current_time):
+        return (current_time >= self.handover_trigger_time and 
+                current_time < self.handover_complete_time)
+                
+    def get_handover_progress(self, current_time):
+        if current_time < self.handover_trigger_time:
+            return 0.0
+        elif current_time >= self.handover_complete_time:
+            return 1.0
+        else:
+            return (current_time - self.handover_trigger_time) / self.handover_duration
+            
+    def set_blend_factor(self, alpha):
+        self.alpha = np.clip(alpha, 0.0, 1.0)
+        
+    def get_control(self, vehicle, timestamp):
+        # Get MPC control
+        self.mpc_controller.update_controls()
+        mpc_throttle, mpc_steer, mpc_brake = self.mpc_controller.get_commands()
+        
+        # Get human control (simulated)
+        self.human_controller.update_controls()
+        human_throttle, human_steer, human_brake = self.human_controller.get_commands()
+        
+        # Blend controls based on alpha
+        throttle = (1 - self.alpha) * mpc_throttle + self.alpha * human_throttle
+        steer = (1 - self.alpha) * mpc_steer + self.alpha * human_steer
+        brake = (1 - self.alpha) * mpc_brake + self.alpha * human_brake
         
         return throttle, steer, brake
 
-# Modified VehicleControl class to integrate RL handover
-class VehicleControlWithHandover:
-    def __init__(self, world, start_in_autopilot, handover_start_time=10.0, 
-                 handover_duration=7.0, human_style='normal', training_mode=True):
-        self._autopilot_enabled = start_in_autopilot
-        self.handover_start_time = handover_start_time
-        self.handover_duration = handover_duration
-        self.handover_end_time = handover_start_time + handover_duration
-        self.human_style = human_style
-        self.current_time = 0.0
-        self.training_mode = training_mode
-        self.episode_num = 0
-        self.episode_rewards = []
-        self.episode_alphas = []
-        self.current_episode_rewards = []
-        self.current_episode_alphas = []
-        
-        # Initialize control
-        if isinstance(world.player, carla.Vehicle):
-            self._control = carla.VehicleControl()
-            world.player.set_autopilot(self._autopilot_enabled)
-            
-            # Create the human MPC controller (simulated human driver)
-            self.human_controller = HumanMPCController(
-                lf=world.controller.controller.lf,
-                lr=world.controller.controller.lr,
-                wheelbase=world.controller.controller.L,
-                planning_horizon=world.planning_horizon,
-                time_step=world.time_step,
-                human_style=human_style
-            )
-            
-            # Create RL handover controller
-            self.rl_handover = RLHandoverController(
-                autonomous_controller=world.controller,
-                human_controller=self.human_controller,
-                handover_start_time=handover_start_time,
-                handover_duration=handover_duration
-            )
-            self.rl_handover.training_mode = training_mode
-            
-            # Set up plotting
-            self.fig, self.axes = plt.subplots(2, 1, figsize=(10, 10))
-            self.handover_times = []
-            self.alpha_values = []
-            
-        else:
-            raise NotImplementedError("Only vehicle actors supported")
 
-    def parse_events(self, client, world, clock):
-        if not self._autopilot_enabled:
-            self._handle_control_with_handover(world)
+class CarlaHandoverEnv:
+    """Environment for handover control in CARLA"""
+    def __init__(
+        self, 
+        carla_world, 
+        mpc_config, 
+        handover_trigger_time=5.0, 
+        handover_duration=5.0,
+        state_features=['lateral_error', 'heading_error', 'speed_error', 'handover_progress'],
+        max_episode_steps=100
+    ):
+        """Initialize environment for handover control learning"""
+        self.world = carla_world
+        self.player = None
+        self.mpc_config = mpc_config
+        self.handover_trigger_time = handover_trigger_time
+        self.handover_duration = handover_duration
+        self.state_features = state_features
+        self.max_episode_steps = max_episode_steps
+        
+        self.state_dim = len(state_features)
+        self.action_dim = 1  # Alpha (blend factor)
+        
+        self.current_time = 0.0
+        self.current_step = 0
+        self.episode_rewards = []
+        
+        self.autonomous_controller = None
+        self.human_controller = None
+        self.handover_controller = None
+        
+        self.target_waypoints = None
+        
+    def reset(self):
+        self.current_time = 0.0
+        self.current_step = 0
+        
+        if self.player:
+            spawn_point = self.player.get_transform()
+            spawn_point.location.z += 2.0
+            self.player.destroy()
+            
+            blueprint = self._get_vehicle_blueprint()
+            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
+        else:
+            blueprint = self._get_vehicle_blueprint()
+            spawn_points = self.world.get_map().get_spawn_points()
+            spawn_point = random.choice(spawn_points)
+            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
+            
+        self._init_controllers()
+        
+        state = self._get_state()
+        
+        return state
+        
+    def step(self, action):
+        alpha = float(action[0])
+        self.handover_controller.set_blend_factor(alpha)
+        
+        throttle, steer, brake = self.handover_controller.get_control(self.player, self.current_time)
+        control = carla.VehicleControl(throttle=float(throttle), steer=float(steer), brake=float(brake))
+        self.player.apply_control(control)
+        
+        self.world.tick()
+        self.current_time += self.mpc_config.time_step
+        self.current_step += 1
+        
+        next_state = self._get_state()
+        
+        reward = self._compute_reward(alpha)
+        
+        done = self.current_step >= self.max_episode_steps or self._is_collision() or self._is_off_road()
+        
+        info = {
+            'time': self.current_time,
+            'handover_progress': self.handover_controller.get_handover_progress(self.current_time),
+            'alpha': alpha
+        }
+        
+        self.episode_rewards.append(reward)
+        
+        return next_state, reward, done, info
     
-    def _handle_control_with_handover(self, world):
-        """Apply control with RL-based handover between autonomous and simulated human"""
-        # Get current vehicle state
-        vehicle = world.player
-        transform = vehicle.get_transform()
-        velocity = vehicle.get_velocity()
+    def _get_vehicle_blueprint(self):
+        blueprints = self.world.get_blueprint_library().filter('vehicle.*')
+        blueprint = random.choice(blueprints)
+        blueprint.set_attribute('role_name', 'hero')
+        return blueprint
+    
+    def _init_controllers(self):
+        physic_control = self.player.get_physics_control()
+        wheels = physic_control.wheels
+        center_of_mass = physic_control.center_of_mass
+        
+        front_wheels = wheels[:2]
+        rear_wheels = wheels[2:]
+        front_pos = np.mean([np.array([w.position.x, w.position.y, w.position.z]) for w in front_wheels], axis=0)
+        rear_pos = np.mean([np.array([w.position.x, w.position.y, w.position.z]) for w in rear_wheels], axis=0)
+        wheelbase = np.sqrt(np.sum((front_pos - rear_pos)**2)) / 100.0  # Convert to meters
+        lf = wheelbase - center_of_mass.x
+        lr = center_of_mass.x
+        
+        self.autonomous_controller = MPCController.Controller(
+            lf=lf,
+            lr=lr,
+            wheelbase=wheelbase,
+            planning_horizon=self.mpc_config.planning_horizon,
+            time_step=self.mpc_config.time_step
+        )
+        
+        # Human controller (simulated with another MPC with different parameters)
+        # We use slightly different parameters to simulate human driver style
+        self.human_controller = MPCController.Controller(
+            lf=lf,
+            lr=lr,
+            wheelbase=wheelbase,
+            planning_horizon=int(self.mpc_config.planning_horizon * 0.8),  # Shorter horizon
+            time_step=self.mpc_config.time_step
+        )
+        
+        self.handover_controller = HandoverController(
+            self.autonomous_controller, 
+            self.human_controller,
+            handover_trigger_time=self.handover_trigger_time,
+            handover_duration=self.handover_duration
+        )
+        
+        self._update_controllers()
+        
+    def _update_controllers(self):
+        transform = self.player.get_transform()
+        velocity = self.player.get_velocity()
         
         current_x = transform.location.x
         current_y = transform.location.y
-        current_yaw = wrap_angle(transform.rotation.yaw)
-        current_speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+        current_yaw = self._wrap_angle(transform.rotation.yaw)
+        current_speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
         
-        # Update current time from simulation
-        _, timestamp = world.hud.get_simulation_information()
-        self.current_time = timestamp
+        self.autonomous_controller.update_values(
+            current_x, current_y, current_yaw, current_speed, self.current_time, 0
+        )
+        self.human_controller.update_values(
+            current_x, current_y, current_yaw, current_speed, self.current_time, 0
+        )
         
-        # Generate waypoints
-        waypoints = self._generate_waypoints(world, transform.location, current_speed)
+        waypoints = self._generate_waypoints()
+        self.autonomous_controller.update_waypoints(waypoints)
+        self.human_controller.update_waypoints(waypoints)
         
-        # Use the RL handover controller to blend controls
-        throttle, steer, brake = self.rl_handover.blend_controls(
-            vehicle, waypoints, self.current_time, timestamp)
-        
-        # Apply the blended control to the vehicle
-        self._control.throttle = throttle
-        self._control.steer = steer
-        self._control.brake = brake
-        vehicle.apply_control(self._control)
-        
-        # Record data for visualization
-        if self.rl_handover.is_handover_phase:
-            self.handover_times.append(self.current_time)
-            self.alpha_values.append(self.rl_handover.current_action[0])
-            self.current_episode_alphas.append(self.rl_handover.current_action[0])
-            
-            if self.rl_handover.last_reward != 0:
-                self.current_episode_rewards.append(self.rl_handover.last_reward)
-            
-            # Visualize the handover process
-            if len(self.handover_times) % 10 == 0:
-                self._update_visualization()
-        
-        # Check if handover just completed
-        if self.current_time >= self.handover_end_time and self.current_time - world.time_step < self.handover_end_time:
-            self._end_episode(world)
-    
-    def _generate_waypoints(self, world, current_location, current_speed):
-        """Generate waypoints for planning horizon"""
+    def _generate_waypoints(self):
         waypoints = []
-        prev_waypoint = world.map.get_waypoint(current_location)
+        current_location = self.player.get_transform().location
+        prev_waypoint = self.world.get_map().get_waypoint(current_location)
         
-        # Calculate distance to next waypoint based on current speed
-        dist = world.time_step * current_speed + 0.1
+        velocity = self.player.get_velocity()
+        current_speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
         
-        # Get first waypoint
-        current_waypoint = prev_waypoint.next(dist)[0]
+        dist = self.mpc_config.time_step * current_speed + 0.1
         
-        # Target speed ramp-up
-        road_desired_speed = world.desired_speed
-        
-        # Generate waypoints for planning horizon
-        for i in range(world.planning_horizon):
-            # Ramp up speed for first 100 control steps
-            if world.control_count + i <= 100:
-                desired_speed = (world.control_count + 1 + i)/100.0 * road_desired_speed
-            else:
-                desired_speed = road_desired_speed
+        for i in range(self.mpc_config.planning_horizon):
+            next_waypoints = prev_waypoint.next(dist)
+            if not next_waypoints:
+                break
                 
-            # Get next waypoint
-            dist = world.time_step * road_desired_speed
-            current_waypoint = prev_waypoint.next(dist)[0]
+            current_waypoint = next_waypoints[0]
             
-            # Store waypoint data [x, y, speed, yaw]
             waypoints.append([
                 current_waypoint.transform.location.x,
                 current_waypoint.transform.location.y,
-                road_desired_speed,
-                wrap_angle(current_waypoint.transform.rotation.yaw)
+                self.mpc_config.desired_speed,
+                self._wrap_angle(current_waypoint.transform.rotation.yaw)
             ])
             
             prev_waypoint = current_waypoint
             
+        self.target_waypoints = waypoints
         return waypoints
-    
-    def _update_visualization(self):
-        """Update visualization of handover process"""
-        # Clear previous plots
-        for ax in self.axes:
-            ax.clear()
         
-        # Plot alpha value over time
-        self.axes[0].plot(self.handover_times, self.alpha_values, 'b-')
-        self.axes[0].set_xlabel('Simulation Time (s)')
-        self.axes[0].set_ylabel('Blending Parameter (α)')
-        self.axes[0].set_title('Control Blending During Handover')
-        self.axes[0].grid(True)
+    def _get_state(self):
+        self._update_controllers()
         
-        # Add regions to show handover phase
-        self.axes[0].axvspan(self.handover_start_time, self.handover_end_time, 
-                            alpha=0.2, color='green', label='Handover Phase')
-        self.axes[0].axhline(y=0.5, color='r', linestyle='--', label='Equal Control')
-        self.axes[0].legend()
+        transform = self.player.get_transform()
+        velocity = self.player.get_velocity()
         
-        # Plot episode rewards if in training mode
-        if self.training_mode and len(self.episode_rewards) > 0:
-            episodes = list(range(1, len(self.episode_rewards) + 1))
-            self.axes[1].plot(episodes, self.episode_rewards, 'g-')
-            self.axes[1].set_xlabel('Episode')
-            self.axes[1].set_ylabel('Total Reward')
-            self.axes[1].set_title('Learning Progress')
-            self.axes[1].grid(True)
+        current_x = transform.location.x
+        current_y = transform.location.y
+        current_yaw = self._wrap_angle(transform.rotation.yaw)
+        current_speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
         
-        plt.tight_layout()
-        plt.pause(0.01)
-    
-    def _end_episode(self, world):
-        """Handle end of an episode (one complete handover)"""
-        self.episode_num += 1
+        lateral_error = 0.0
+        heading_error = 0.0
+        speed_error = 0.0
         
-        # Save episode data
-        if len(self.current_episode_rewards) > 0:
-            total_reward = sum(self.current_episode_rewards)
-            self.episode_rewards.append(total_reward)
+        if self.target_waypoints:
+            min_dist = float('inf')
+            closest_idx = 0
             
-            # Calculate average alpha
-            avg_alpha = sum(self.current_episode_alphas) / len(self.current_episode_alphas)
-            self.episode_alphas.append(avg_alpha)
+            for i, wp in enumerate(self.target_waypoints):
+                wp_x, wp_y = wp[0], wp[1]
+                dist = math.sqrt((wp_x - current_x)**2 + (wp_y - current_y)**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = i
             
-            print(f"Episode {self.episode_num} completed - Total reward: {total_reward:.2f}, Avg α: {avg_alpha:.2f}")
+            wp = self.target_waypoints[closest_idx]
+            wp_x, wp_y, wp_speed, wp_yaw = wp
             
-            # Reset episode data
-            self.current_episode_rewards = []
-            self.current_episode_alphas = []
+            lateral_error = min_dist
             
-            # Save the model periodically
-            if self.episode_num % 10 == 0 and self.training_mode:
-                self.rl_handover.save_model(f"handover_model_ep{self.episode_num}.pth")
+            heading_error = abs(wp_yaw - current_yaw)
+            if heading_error > np.pi:
+                heading_error = 2 * np.pi - heading_error
+            
+            speed_error = abs(wp_speed - current_speed)
         
-        # Teleport to start position for next episode
-        if self.training_mode:
-            spawn_points = world.map.get_spawn_points()
-            # Either use fixed spawn or random spawn based on preference
-            spawn_point = random.choice(spawn_points)
-            world.player.set_transform(spawn_point)
-            
-            # Reset simulation time (would need to be implemented in the world class)
-            # This is a placeholder - in practice you might need to restart the simulation
-            # or implement a time reset mechanism
-            
-    @staticmethod
-    def _is_quit_shortcut(key):
-        return (key == K_ESCAPE) or (key == K_q and pygame.key.get_mods() & KMOD_CTRL)
-    
-def game_loop_with_handover(args):
-    """Main game loop with RL-based handover control"""
-    pygame.init()
-    pygame.font.init()
-    world = None
-
-    try:
-        # Connect to CARLA server
-        client = carla.Client(args.host, args.port)
-        client.set_timeout(10.0)
-
-        # Setup display
-        display = pygame.display.set_mode(
-            (args.width, args.height),
-            pygame.HWSURFACE | pygame.DOUBLEBUF
-        )
-
-        # Load world and setup simulation
-        hud = HUD(args.width, args.height)
-        carla_world = client.load_world(args.map)
-        world = World(carla_world, hud, args)
+        handover_progress = self.handover_controller.get_handover_progress(self.current_time)
         
-        # Create handover controller instead of standard controller
-        controller = VehicleControlWithHandover(
-            world, 
-            args.autopilot,
-            handover_start_time=args.handover_start_time,
-            handover_duration=args.handover_duration,
-            human_style=args.human_style,
-            training_mode=args.training_mode
-        )
+        state = []
+        
+        for feature in self.state_features:
+            if feature == 'lateral_error':
+                state.append(lateral_error)
+            elif feature == 'heading_error':
+                state.append(heading_error)
+            elif feature == 'speed_error':
+                state.append(speed_error)
+            elif feature == 'handover_progress':
+                state.append(handover_progress)
+            elif feature == 'current_speed':
+                state.append(current_speed)
+            elif feature == 'current_time':
+                state.append(self.current_time)
+        
+        return np.array(state)
+        
+    def _compute_reward(self, alpha):
+        transform = self.player.get_transform()
+        velocity = self.player.get_velocity()
+        
+        current_x = transform.location.x
+        current_y = transform.location.y
+        current_yaw = self._wrap_angle(transform.rotation.yaw)
+        current_speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+        
+        reward = 0.0
+        
+        # 1. Path following reward (lateral error penalty)
+        lateral_error = 0.0
+        if self.target_waypoints:
+            min_dist = float('inf')
+            closest_idx = 0
+            
+            for i, wp in enumerate(self.target_waypoints):
+                wp_x, wp_y = wp[0], wp[1]
+                dist = math.sqrt((wp_x - current_x)**2 + (wp_y - current_y)**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = i
+            
+            lateral_error = min_dist
+        
+        path_reward = -lateral_error * 0.5
+        
+        # 2. Speed maintenance reward
+        speed_reward = -abs(self.mpc_config.desired_speed - current_speed) * 0.1
+        
+        # 3. Handover smoothness reward
+        # During handover, reward smooth transitions in alpha
+        handover_reward = 0.0
+        if self.handover_controller.is_handover_active(self.current_time):
+            # Get handover progress (0 to 1)
+            progress = self.handover_controller.get_handover_progress(self.current_time)
+            
+            # Simple linear blend would be alpha = progress
+            # Reward smaller deviation from this baseline during transition
+            baseline_alpha = progress
+            handover_reward = -abs(alpha - baseline_alpha) * 2.0
+        else:
+            # Before handover, alpha should be 0; after handover, alpha should be 1
+            if self.current_time < self.handover_trigger_time:
+                handover_reward = -abs(alpha - 0.0) * 2.0
+            else:
+                handover_reward = -abs(alpha - 1.0) * 2.0
+        
+        reward = path_reward + speed_reward + handover_reward
+        
+        if self._is_off_road():
+            reward -= 50.0
+        
+        return reward
+        
+    def _is_off_road(self):
+        waypoint = self.world.get_map().get_waypoint(self.player.get_transform().location)
+        return not waypoint.lane_type == carla.LaneType.Driving
+        
+    def _wrap_angle(self, angle_in_degree):
+        angle_in_rad = angle_in_degree / 180.0 * np.pi
+        while angle_in_rad > np.pi:
+            angle_in_rad -= 2 * np.pi
+        while angle_in_rad <= -np.pi:
+            angle_in_rad += 2 * np.pi
+        return angle_in_rad
 
-        # Main loop
-        clock = pygame.time.Clock()
-        while True:
-            clock.tick_busy_loop(args.fps)
-            controller.parse_events(client, world, clock)
-            world.tick(clock)
-            world.render(display)
-            pygame.display.flip()
 
-    finally:
-        if world is not None:
-            world.destroy()
-        pygame.quit()
+def train_rl_agent(env, agent, num_episodes=1000, max_steps=100):
+    rewards = []
+    
+    for i_episode in tqdm(range(1, num_episodes+1), desc="Training"):
+        state = env.reset()
+        episode_reward = 0
+        
+        for t in range(max_steps):
+            action = agent.act(state, agent.epsilon)
+            next_state, reward, done, _ = env.step(action)
+            agent.step(state, action, reward, next_state, done)
+            state = next_state
+            episode_reward += reward
+            
+            if done:
+                break
+        
+        rewards.append(episode_reward)
+        
+        if i_episode % 100 == 0:
+            print(f"Episode {i_episode}/{num_episodes}, Avg Reward: {np.mean(rewards[-100:]):.2f}, Epsilon: {agent.epsilon:.2f}")
+    
+    return rewards
 
-def main_with_handover():
-    """Parse arguments and start simulation with handover capability"""
-    argparser = argparse.ArgumentParser(description='CARLA MPC Control with RL Handover')
-    
-    # Connection settings
-    argparser.add_argument('--host', metavar='H', default='127.0.0.1', help='IP of the host server (default: 127.0.0.1)')
-    argparser.add_argument('-p', '--port', metavar='P', default=2000, type=int, help='TCP port to listen to (default: 2000)')
-    
-    # Display settings
-    argparser.add_argument('--res', metavar='WIDTHxHEIGHT', default='1280x720', help='window resolution (default: 1280x720)')
-    argparser.add_argument('--gamma', default=2.2, type=float, help='Gamma correction of the camera (default: 2.2)')
-    
-    # Simulation settings
-    argparser.add_argument('--map', metavar='NAME', default='Town04', help='simulation map (default: "Town04")')
-    argparser.add_argument('-a', '--autopilot', action='store_true', help='enable autopilot')
-    argparser.add_argument('--fps', default=10, type=int, help='Frames per second for simulation (default: 10)')
-    
-    # Vehicle settings
-    argparser.add_argument('--filter', metavar='PATTERN', default='vehicle.*', help='actor filter (default: "vehicle.*")')
-    argparser.add_argument('--vehicle_id', metavar='NAME', default='vehicle.audi.a2', 
-                          help='vehicle to spawn (default: vehicle.audi.a2)')
-    
-    # Spawn settings
-    argparser.add_argument('--spawn_x', metavar='X', default='-14', help='x position to spawn the agent (default: -14)')
-    argparser.add_argument('--spawn_y', metavar='Y', default='70', help='y position to spawn the agent (default: 70)')
-    argparser.add_argument('--random_spawn', metavar='RS', default=0, type=int, help='Random spawn agent (default: 0)')
-    
-    # Controller settings
-    argparser.add_argument('--waypoint_resolution', metavar='WR', default=0.5, type=float, 
-                          help='waypoint resolution for control (default: 0.5)')
-    argparser.add_argument('--waypoint_lookahead_distance', metavar='WLD', default=5.0, type=float,
-                          help='waypoint look ahead distance for control (default: 5.0)')
-    argparser.add_argument('--desired_speed', metavar='SPEED', default=30, type=float,
-                          help='desired speed for driving (default: 30)')
-    argparser.add_argument('--planning_horizon', metavar='HORIZON', default=10, type=int,
-                          help='planning horizon for control (default: 10)')
-    argparser.add_argument('--time_step', metavar='TS', default=0.1, type=float,
-                          help='time step for control (default: 0.1)')
-    argparser.add_argument('--handover_start_time', metavar='HST', default=10.0, type=float,
-                          help='start time for handover (default: 10.0)')
-    argparser.add_argument('--handover_duration', metavar='HD', default=7.0, type=float,
-                          help='duration of handover (default: 7.0)')
-    argparser.add_argument('--human_style', metavar='HS', default='normal',
-                          help='human driving style (normal, aggressive, cautious)')
-    argparser.add_argument('--training_mode', action='store_true', help='enable training mode for RL')
-    argparser.add_argument('--save_model', metavar='MODEL', default='handover_model.pth',
-                          help='path to save the RL model (default: handover_model.pth)')
-    argparser.add_argument('--load_model', metavar='MODEL', default=None,
-                          help='path to load the RL model (default: None)')
-    argparser.add_argument('--render', action='store_true', help='enable rendering')
 
-    # Debug options
-    argparser.add_argument('-v', '--verbose', action='store_true', dest='debug', help='print debug information')
+def evaluate_policy(env, agent, num_episodes=10):
+    rewards = []
     
-    args = argparser.parse_args()
-    args.width, args.height = [int(x) for x in args.res.split('x')]
+    for i in range(num_episodes):
+        state = env.reset()
+        episode_reward = 0
+        done = False
+        
+        while not done:
+            action = agent.act(state, eps=0.0)
+            next_state, reward, done, _ = env.step(action)
+            state = next_state
+            episode_reward += reward
+        
+        rewards.append(episode_reward)
+    
+    avg_reward = np.mean(rewards)
+    print(f"Evaluation over {num_episodes} episodes: {avg_reward:.2f}")
+    return avg_reward
 
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(format='%(levelname)s: %(message)s', level=log_level)
 
-    try:
-        game_loop_with_handover(args)
-    except KeyboardInterrupt:
-        print('\nCancelled by user. Bye!')
+def main():
+    client = carla.Client('localhost', 2000)
+    client.set_timeout(10.0)
+    
+    world = client.get_world()
+    
+    class MPCConfig:
+        planning_horizon = 5
+        time_step = 0.3
+        desired_speed = 30
+        waypoint_resolution = 0.5
+        waypoint_lookahead_distance = 5.0
+    
+    mpc_config = MPCConfig()
+    
+    env = CarlaHandoverEnv(
+        world,
+        mpc_config,
+        handover_trigger_time=5.0,
+        handover_duration=5.0,
+        max_episode_steps=100
+    )
+    
+    state_dim = env.state_dim
+    action_dim = env.action_dim
+    agent = RLAgent(state_size=state_dim, action_size=action_dim, seed=0)
+    
+    print("Training RL agent...")
+    rewards = train_rl_agent(env, agent, num_episodes=500, max_steps=env.max_episode_steps)
+    
+    torch.save(agent.qnetwork_local.state_dict(), "handover_policy.pth")
+    
+    print("Evaluating policy...")
+    eval_reward = evaluate_policy(env, agent)
+    
+    print("Training complete!")
 
-if __name__ == '__main__':
-    main_with_handover()
+
+if __name__ == "__main__":
+    main()
