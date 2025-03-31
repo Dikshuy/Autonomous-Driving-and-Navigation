@@ -6,6 +6,8 @@
 # This work is licensed under the terms of the MIT license.
 # For a copy, see <https://opensource.org/licenses/MIT>.
 
+# updates in reference tracking and vehicle control
+
 import glob
 import os
 import sys
@@ -410,8 +412,8 @@ def main():
                           help='vehicle to spawn (default: vehicle.audi.a2)')
     
     # Spawn settings
-    argparser.add_argument('--spawn_x', metavar='X', default='-510', help='x position to spawn the agent (default: 120)')
-    argparser.add_argument('--spawn_y', metavar='Y', default='200', help='y position to spawn the agent (default: -8)')
+    argparser.add_argument('--spawn_x', metavar='X', default='-14', help='x position to spawn the agent (default: -14)')
+    argparser.add_argument('--spawn_y', metavar='Y', default='70', help='y position to spawn the agent (default: 70)')
     argparser.add_argument('--random_spawn', metavar='RS', default=0, type=int, help='Random spawn agent (default: 0)')
     
     # Controller settings

@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 
-"""
-2D Controller Class to be used for the CARLA waypoint follower demo.
-"""
 import numpy as np
 import math
 from matplotlib import pyplot as plt
@@ -400,9 +397,6 @@ class Controller(object):
         self._set_brake = brake
 
     def update_controls(self):
-        ######################################################
-        # RETRIEVE SIMULATOR FEEDBACK
-        ######################################################
         x = self._current_x
         y = self._current_y
         yaw = self._current_yaw
@@ -416,9 +410,6 @@ class Controller(object):
             acceleration, steer_output = \
                 self.controller.get_inputs(x, y, yaw, v, np.array(self._waypoints).T)
 
-            ######################################################
-            # SET CONTROLS OUTPUT
-            ######################################################
         if acceleration > 0:
             # throttle_output = np.tanh(acceleration)
             # throttle_output = max(0.0, min(1.0, throttle_output))
