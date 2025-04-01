@@ -535,7 +535,7 @@ class CarlaHandoverEnv:
             lateral_error = min_dist
         
         # lateral error penalty
-        path_reward = -lateral_error/10.0
+        path_reward = -lateral_error/1000.0
         
         # 2. Speed maintenance reward
         speed_error = abs(self.mpc_config.desired_speed - current_speed)
@@ -546,18 +546,18 @@ class CarlaHandoverEnv:
         progress = self.handover_controller.get_handover_progress(self.current_time)
         
         # Calculate smoothness penalty based on change in alpha
-        smoothness_penalty = -2.0 * abs(alpha - self.prev_alpha)
+        smoothness_penalty = -0.5 * abs(alpha - self.prev_alpha)
         
         if self.handover_controller.is_handover_active(self.current_time):
             ideal_alpha = 1.0 / (1.0 + np.exp(-10 * (progress - 0.5)))
-            handover_reward = -4.0 * abs(alpha - ideal_alpha) + smoothness_penalty
+            handover_reward = -4.0 * abs(alpha - ideal_alpha)
         else:
             if self.current_time < self.handover_trigger_time:
-                handover_reward = -4.0 * abs(alpha - 0.0) + smoothness_penalty
+                handover_reward = -4.0 * abs(alpha - 0.0)
             else:
-                handover_reward = -4.0 * abs(alpha - 1.0) + smoothness_penalty
+                handover_reward = -4.0 * abs(alpha - 1.0)
         
-        reward = path_reward + speed_reward + handover_reward
+        reward = path_reward + speed_reward + smoothness_penalty # + handover_reward
             
         if self._is_off_road():
             reward -= 50.0
