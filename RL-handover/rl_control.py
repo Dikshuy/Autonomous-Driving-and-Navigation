@@ -84,13 +84,13 @@ class ReplayBuffer:
 
 
 class RLAgent:
-    def __init__(self, state_size, action_size, seed, num_discrete_actions=10):
+    def __init__(self, state_size, action_size, seed, num_discrete_actions=20):
         self.state_size = state_size
         self.action_size = num_discrete_actions  # Number of discrete alpha values
         self.seed = random.seed(seed)
         self.epsilon = 1.0
-        self.epsilon_min = 0.05
-        self.epsilon_decay = 0.99995
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.9995
         self.num_discrete_actions = num_discrete_actions
         
         self.qnetwork_local = QNetwork(state_size, num_discrete_actions, seed).to(device)
@@ -557,7 +557,7 @@ class CarlaHandoverEnv:
             else:
                 handover_reward = -4.0 * abs(alpha - 1.0)
         
-        reward = path_reward + speed_reward + smoothness_penalty # + handover_reward
+        reward = path_reward + speed_reward + smoothness_penalty + 14 # + handover_reward
             
         if self._is_off_road():
             reward -= 50.0
