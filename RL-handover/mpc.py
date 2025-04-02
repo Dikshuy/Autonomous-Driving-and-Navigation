@@ -125,44 +125,28 @@ class MPC:
         return idx, cx[idx], cy[idx]
 
     def get_linearized_dynamics(self, yaw, delta, v, dt=0.01):
-        # A = np.eye(4)
-        # A[0, 2] = np.cos(yaw) * dt
-        # A[0, 3] = -v * np.sin(yaw) * dt
-        # A[1, 2] = np.sin(yaw) * dt
-        # A[1, 3] = v * np.cos(yaw) * dt
-        # A[3, 2] = np.tan(delta) * dt / self.L
-
-        # B = np.zeros((4, 2))
-        # B[2, 0] = dt
-        # B[3, 1] = v * dt / (self.L * np.cos(delta)**2)
-
-        # C = np.zeros((4, 1))
-        # C[0, 0] = v * np.sin(yaw) * yaw * dt
-        # C[1, 0] = - v * np.cos(yaw) * yaw * dt
-        # C[3, 0] = - v * delta * dt / (self.L * np.cos(delta)**2)
-
         tandelta = math.tan(delta)
-        angel = yaw + math.atanh((self.lr*tandelta)/self.L)
+        angle = yaw + math.atanh((self.lr*tandelta)/self.L)
         deno1 = np.tan(delta)**2 + 1
         deno2 = (self.lr**2*tandelta**2)/self.L**2 + 1
         deno3 = self.L * np.sqrt(deno2)
-        # print(f"angles {yaw}, {angel}, {tandelta}")
+        # print(f"angles {yaw}, {angle}, {tandelta}")
 
-        A = np.array([[ 0, 0, np.cos(angel), -v*np.sin(angel)],
-                    [ 0, 0, np.sin(angel),  v*np.cos(angel)],
+        A = np.array([[ 0, 0, np.cos(angle), -v*np.sin(angle)],
+                    [ 0, 0, np.sin(angle),  v*np.cos(angle)],
                     [ 0, 0, 0, 0],
                     [ 0, 0, tandelta/deno3, 0]]) * dt
         A = A + np.eye(4)
 
-        B = np.array([[ 0, -(self.lr*v*np.sin(angel)*(deno1))/(self.L*(deno2))],
-                    [ 0, (self.lr*v*np.cos(angel)*(deno1))/(self.L*(deno2))],
+        B = np.array([[ 0, -(self.lr*v*np.sin(angle)*(deno1))/(self.L*(deno2))],
+                    [ 0, (self.lr*v*np.cos(angle)*(deno1))/(self.L*(deno2))],
                     [ 1, 0],
                     [ 0, (v*(deno1))/deno3 - (self.lr**2*v*tandelta**2*(deno1))/(deno3**3)]])
         B *= dt
 
         C = np.zeros((4, 1))
-        C[0, 0] = yaw*v*np.sin(angel) + (delta*self.lr*v*np.sin(angel)*deno1)/(self.L*(deno2))
-        C[1, 0] = -yaw*v*np.cos(angel) - (delta*self.lr*v*np.cos(angel)*deno1)/(self.L*(deno2))
+        C[0, 0] = yaw*v*np.sin(angle) + (delta*self.lr*v*np.sin(angle)*deno1)/(self.L*(deno2))
+        C[1, 0] = -yaw*v*np.cos(angle) - (delta*self.lr*v*np.cos(angle)*deno1)/(self.L*(deno2))
         C[2, 0] = 0
         C[3, 0] = -delta*(v*deno1)/(deno3) - (self.lr**2*v*tandelta**2*deno1)/(deno3**3)
         C *= dt

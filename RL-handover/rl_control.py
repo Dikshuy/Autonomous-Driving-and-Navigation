@@ -535,18 +535,18 @@ class CarlaHandoverEnv:
             lateral_error = min_dist
         
         # lateral error penalty
-        path_reward = lateral_error/1000.0
+        path_reward = -lateral_error/1000.0
         
         # 2. Speed maintenance reward
         speed_error = abs(self.mpc_config.desired_speed - current_speed)
-        speed_reward = 0.5 * speed_error
+        speed_reward = -0.5 * speed_error
         
         # 3. Handover smoothness reward
         handover_reward = 0.0
         progress = self.handover_controller.get_handover_progress(self.current_time)
         
         # Calculate smoothness penalty based on change in alpha
-        smoothness_penalty = 0.5 * abs(alpha - self.prev_alpha)
+        smoothness_penalty = -0.5 * abs(alpha - self.prev_alpha)
         
         if self.handover_controller.is_handover_active(self.current_time):
             ideal_alpha = 1.0 / (1.0 + np.exp(-10 * (progress - 0.5)))
@@ -679,7 +679,7 @@ def main():
     agent = RLAgent(state_size=state_dim, action_size=action_dim, seed=0)
     
     print("Training RL agent...")
-    rewards, avg_rewards = train_rl_agent(env, agent, num_episodes=5000, max_steps=env.max_episode_steps)
+    rewards, avg_rewards = train_rl_agent(env, agent, num_episodes=10000, max_steps=env.max_episode_steps)
     
     # torch.save(agent.qnetwork_local.state_dict(), "handover_policy.pth")
     np.save("training_rewards.npy", np.array(rewards))
