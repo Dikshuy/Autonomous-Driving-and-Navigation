@@ -20,6 +20,9 @@ import pygame
 from pygame.locals import KMOD_CTRL, K_ESCAPE, K_q
 import argparse
 import logging
+import time
+import cv2
+from datetime import datetime
 
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
@@ -55,6 +58,58 @@ def get_vehicle_wheelbases(wheels, center_of_mass):
     
     return wheelbase - center_of_mass.x, center_of_mass.x, wheelbase
 
+class VideoRecorder:
+    def __init__(self, width, height, fps, duration=15):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.duration = duration
+        self.recording = False
+        self.frames = []
+        self.start_time = 0
+        self.output_filename = f"carla_recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+        
+    def start_recording(self):
+        self.recording = True
+        self.frames = []
+        self.start_time = time.time()
+        print(f"Recording started, will capture for {self.duration} seconds...")
+        
+    def capture_frame(self, surface):
+        if not self.recording:
+            return
+            
+        elapsed = time.time() - self.start_time
+        if elapsed > self.duration:
+            self.stop_recording()
+            return
+            
+        frame = pygame.surfarray.array3d(surface)
+        frame = np.transpose(frame, (1, 0, 2))
+        self.frames.append(frame)
+        
+    def stop_recording(self):
+        if not self.recording:
+            return
+            
+        self.recording = False
+        print(f"Recording stopped. Saving {len(self.frames)} frames to {self.output_filename}")
+        
+        if len(self.frames) > 0:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video = cv2.VideoWriter(self.output_filename, fourcc, self.fps, (self.width, self.height))
+
+            for frame in self.frames:
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                video.write(frame_bgr)
+                
+            video.release()
+            print(f"Video saved successfully to {self.output_filename}")
+        else:
+            print("No frames were captured. Video not saved.")
+            
+        self.frames = []
+
 class World:
     def __init__(self, carla_world, hud, args):
         self.world = carla_world
@@ -73,6 +128,9 @@ class World:
         self.time_step = args.time_step
         self.controller = None
         self.control_count = 0.0
+        
+        # Initialize video recorder
+        self.recorder = VideoRecorder(args.width, args.height, args.fps)
         
         self.restart()
         self.world.on_tick(hud.on_world_tick)
@@ -158,11 +216,18 @@ class World:
 
     def render(self, display):
         self.camera_manager.render(display)
+        
+        if self.recorder.recording:
+            self.recorder.capture_frame(display)
 
     def tick(self, clock):
         pass
 
     def destroy(self):
+        # Stop recording if still active
+        if self.recorder.recording:
+            self.recorder.stop_recording()
+            
         if self.camera_manager and self.camera_manager.sensor:
             self.camera_manager.sensor.destroy()
         if self.player:
@@ -173,6 +238,7 @@ class World:
 class VehicleControl:
     def __init__(self, world, start_in_autopilot):
         self._autopilot_enabled = start_in_autopilot
+        self._recording_started = False
         
         if isinstance(world.player, carla.Vehicle):
             self._control = carla.VehicleControl()
@@ -181,11 +247,25 @@ class VehicleControl:
             raise NotImplementedError("Only vehicle actors supported")
 
     def parse_events(self, client, world, clock):
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return True
+            
+            # Start recording when R key is pressed
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_r and not self._recording_started:
+                    world.recorder.start_recording()
+                    self._recording_started = True
+                    
+                if VehicleControl._is_quit_shortcut(event.key):
+                    return True
+        
         if not self._autopilot_enabled:
             self._handle_manual_control(world)
             
+        return False
+            
     def _handle_manual_control(self, world):
-        """Apply MPC control based on waypoints"""
         # Get current vehicle state
         vehicle = world.player
         transform = vehicle.get_transform()
@@ -260,6 +340,15 @@ class HUD:
         self.frame = 0
         self.simulation_time = 0
         self._server_clock = pygame.time.Clock()
+        
+        font = pygame.font.Font(pygame.font.get_default_font(), 20)
+        fonts = [x for x in pygame.font.get_fonts()]
+        default_font = 'ubuntumono'
+        mono = default_font if default_font in fonts else fonts[0]
+        mono = pygame.font.match_font(mono)
+        self._font_mono = pygame.font.Font(mono, 14)
+        self._recording_text = self._font_mono.render("Press R to start recording", True, (255, 255, 255))
+        self._recording_active_text = self._font_mono.render("Recording...", True, (255, 0, 0))
 
     def on_world_tick(self, timestamp):
         self._server_clock.tick()
@@ -269,6 +358,15 @@ class HUD:
     
     def get_simulation_information(self):
         return self.frame, self.simulation_time
+        
+    def render(self, display, recorder):
+        if recorder.recording:
+            elapsed = time.time() - recorder.start_time
+            remaining = max(0, recorder.duration - elapsed)
+            recording_text = self._font_mono.render(f"Recording... {remaining:.1f}s remaining", True, (255, 0, 0))
+            display.blit(recording_text, (8, 8))
+        else:
+            display.blit(self._recording_text, (8, 8))
 
 class CameraManager:
     def __init__(self, parent_actor, hud, gamma_correction):
@@ -336,6 +434,7 @@ class CameraManager:
         """Render camera view to display"""
         if self.surface is not None:
             display.blit(self.surface, (0, 0))
+            self.hud.render(display, self._parent.get_world().recorder)
 
     @staticmethod
     def _parse_image(weak_self, image):
@@ -357,6 +456,8 @@ def game_loop(args):
     pygame.init()
     pygame.font.init()
     world = None
+    
+    pygame.display.set_caption("CARLA MPC Controller - Press R to record")
 
     try:
         # Connect to CARLA server
@@ -374,12 +475,18 @@ def game_loop(args):
         carla_world = client.load_world(args.map)
         world = World(carla_world, hud, args)
         controller = VehicleControl(world, args.autopilot)
+        
+        if args.auto_record:
+            world.recorder.start_recording()
+            controller._recording_started = True
 
         # Main loop
         clock = pygame.time.Clock()
-        while True:
+        exit_game = False
+        
+        while not exit_game:
             clock.tick_busy_loop(args.fps)
-            controller.parse_events(client, world, clock)
+            exit_game = controller.parse_events(client, world, clock)
             world.tick(clock)
             world.render(display)
             pygame.display.flip()
@@ -404,7 +511,7 @@ def main():
     # Simulation settings
     argparser.add_argument('--map', metavar='NAME', default='Town04', help='simulation map (default: "Town04")')
     argparser.add_argument('-a', '--autopilot', action='store_true', help='enable autopilot')
-    argparser.add_argument('--fps', default=10, type=int, help='Frames per second for simulation (default: 10)')
+    argparser.add_argument('--fps', default=30, type=int, help='Frames per second for simulation (default: 30)')
     
     # Vehicle settings
     argparser.add_argument('--filter', metavar='PATTERN', default='vehicle.*', help='actor filter (default: "vehicle.*")')
@@ -427,6 +534,10 @@ def main():
                           help='Planning horizon for MPC (default: 5)')
     argparser.add_argument('--time_step', metavar='DT', default=0.3, type=float,
                           help='Planning time step for MPC (default: 0.3)')
+    
+    # Recording settings
+    argparser.add_argument('--auto_record', action='store_true', help='Start recording automatically')
+    argparser.add_argument('--record_duration', default=15, type=int, help='Recording duration in seconds (default: 15)')
     
     # Debug options
     argparser.add_argument('-v', '--verbose', action='store_true', dest='debug', help='print debug information')
