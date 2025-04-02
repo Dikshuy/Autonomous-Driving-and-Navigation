@@ -434,7 +434,7 @@ class CameraManager:
         """Render camera view to display"""
         if self.surface is not None:
             display.blit(self.surface, (0, 0))
-            self.hud.render(display, self._parent.get_world().recorder)
+            # self.hud.render(display, self._parent.get_world().recorder)
 
     @staticmethod
     def _parse_image(weak_self, image):
@@ -457,7 +457,7 @@ def game_loop(args):
     pygame.font.init()
     world = None
     
-    pygame.display.set_caption("CARLA MPC Controller - Press R to record")
+    pygame.display.set_caption("CARLA MPC Controller")
 
     try:
         # Connect to CARLA server
@@ -520,7 +520,7 @@ def main():
     
     # Spawn settings
     argparser.add_argument('--spawn_x', metavar='X', default='-14', help='x position to spawn the agent (default: -14)')
-    argparser.add_argument('--spawn_y', metavar='Y', default='70', help='y position to spawn the agent (default: 70)')
+    argparser.add_argument('--spawn_y', metavar='Y', default='114', help='y position to spawn the agent (default: 70)')
     argparser.add_argument('--random_spawn', metavar='RS', default=0, type=int, help='Random spawn agent (default: 0)')
     
     # Controller settings
@@ -537,7 +537,7 @@ def main():
     
     # Recording settings
     argparser.add_argument('--auto_record', action='store_true', help='Start recording automatically')
-    argparser.add_argument('--record_duration', default=15, type=int, help='Recording duration in seconds (default: 15)')
+    argparser.add_argument('--record_duration', default=25, type=int, help='Recording duration in seconds (default: 15)')
     
     # Debug options
     argparser.add_argument('-v', '--verbose', action='store_true', dest='debug', help='print debug information')
